@@ -1,3 +1,4 @@
 [workspace]
-members = ["crates/bg-tok"]
+members = ["crates/bg-tok", "crates/bg-tok-mock"]
+default-members = ["crates/bg-tok"]
 resolver = "2"

@@ -46,6 +46,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bg-tok-mock"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bg-tok",
+ "bytes",
+ "futures-util",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
