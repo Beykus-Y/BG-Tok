@@ -3,8 +3,10 @@ use std::{pin::Pin, time::Duration};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use reqwest::{header, Client, StatusCode, Url};
+use reqwest::{header, Client, Method, StatusCode, Url};
+use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Error)]
@@ -49,6 +51,8 @@ pub struct HttpConfig {
     /// Per-attempt deadline, including consumption of the response body.
     pub request_timeout: Duration,
     pub max_retries: u32,
+    /// Maximum active requests, including bodies still being read.
+    pub max_in_flight: usize,
     pub backoff: Duration,
     pub max_backoff: Duration,
     /// HTTP(S) or SOCKS proxy configured by the host. Never logged.
@@ -61,6 +65,7 @@ impl Default for HttpConfig {
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(60),
             max_retries: 2,
+            max_in_flight: 8,
             backoff: Duration::from_millis(200),
             max_backoff: Duration::from_secs(5),
             proxy: None,
@@ -77,6 +82,7 @@ impl std::fmt::Debug for HttpConfig {
             .field("connect_timeout", &self.connect_timeout)
             .field("request_timeout", &self.request_timeout)
             .field("max_retries", &self.max_retries)
+            .field("max_in_flight", &self.max_in_flight)
             .field("backoff", &self.backoff)
             .field("max_backoff", &self.max_backoff)
             .field("proxy", &self.proxy.as_ref().map(|_| "[redacted]"))
@@ -86,10 +92,32 @@ impl std::fmt::Debug for HttpConfig {
 
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, NetworkError>> + Send>>;
 
+/// Headers may be sensitive. Neither this response nor requests implement Debug.
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: header::HeaderMap,
+    pub body: ByteStream,
+}
+
+/// Transport can be replaced by the host or by a test implementation.
+#[async_trait::async_trait]
+pub trait Transport: Send + Sync {
+    async fn send(
+        &self,
+        method: Method,
+        url: &Url,
+        headers: header::HeaderMap,
+        body: Option<Bytes>,
+        range: Option<ByteRange>,
+        cancel: CancellationToken,
+    ) -> Result<HttpResponse, NetworkError>;
+}
+
 #[derive(Clone)]
 pub struct HttpTransport {
     client: Client,
     config: HttpConfig,
+    permits: Arc<Semaphore>,
 }
 
 impl HttpTransport {
@@ -97,6 +125,8 @@ impl HttpTransport {
         if config.connect_timeout.is_zero()
             || config.request_timeout.is_zero()
             || config.max_retries > 10
+            || config.max_in_flight == 0
+            || config.max_in_flight > 1024
         {
             return Err(NetworkError::Configuration);
         }
@@ -111,7 +141,12 @@ impl HttpTransport {
                 builder.proxy(reqwest::Proxy::all(proxy).map_err(|_| NetworkError::Configuration)?);
         }
         let client = builder.build().map_err(|_| NetworkError::Configuration)?;
-        Ok(Self { client, config })
+        let permits = Arc::new(Semaphore::new(config.max_in_flight));
+        Ok(Self {
+            client,
+            config,
+            permits,
+        })
     }
 
     /// GET is retried only before a response body is returned to the caller.
@@ -123,25 +158,56 @@ impl HttpTransport {
         range: Option<ByteRange>,
         cancel: CancellationToken,
     ) -> Result<ByteStream, NetworkError> {
+        Ok(self
+            .request(
+                Method::GET,
+                url,
+                header::HeaderMap::new(),
+                None,
+                range,
+                cancel,
+            )
+            .await?
+            .body)
+    }
+
+    /// Non-GET requests are never retried: they may have changed server state.
+    /// Header values and request bodies may contain secrets and are never logged.
+    pub async fn request(
+        &self,
+        method: Method,
+        url: &Url,
+        headers: header::HeaderMap,
+        body: Option<Bytes>,
+        range: Option<ByteRange>,
+        cancel: CancellationToken,
+    ) -> Result<HttpResponse, NetworkError> {
+        if range.is_some() && method != Method::GET {
+            return Err(NetworkError::Configuration);
+        }
         if !matches!(url.scheme(), "http" | "https") {
             return Err(NetworkError::Configuration);
         }
         if let Some(r) = range {
             ByteRange::new(r.start, r.end)?;
         }
+        let permit = tokio::select! { biased; _ = cancel.cancelled() => return Err(NetworkError::Cancelled), p = self.permits.clone().acquire_owned() => p.map_err(|_| NetworkError::Transport)? };
         let mut attempt = 0;
         loop {
             let mut request = self
                 .client
-                .get(url.clone())
+                .request(method.clone(), url.clone())
+                .headers(headers.clone())
                 .header(header::ACCEPT_ENCODING, "identity");
+            if let Some(body) = &body {
+                request = request.body(body.clone());
+            }
             if let Some(r) = range {
                 let end = r.end.map(|v| v.to_string()).unwrap_or_default();
                 request = request.header(header::RANGE, format!("bytes={}-{end}", r.start));
             }
             let result = tokio::select! { biased; _ = cancel.cancelled() => return Err(NetworkError::Cancelled), result = request.send() => result };
-            let retry_after;
-            match result {
+            let retry_after = match result {
                 Ok(response) => {
                     let status = response.status();
                     if status.is_success() {
@@ -158,66 +224,90 @@ impl HttpTransport {
                                 return Err(NetworkError::InvalidRange);
                             }
                         }
+                        let headers = response.headers().clone();
                         let stream = response.bytes_stream();
                         let cancelled = cancel.clone();
                         let output = futures_util::stream::unfold(
-                            (stream, cancelled, false),
-                            |(mut stream, cancel, done)| async move {
+                            (stream, cancelled, false, permit),
+                            |(mut stream, cancel, done, permit)| async move {
                                 if done {
                                     return None;
                                 }
                                 tokio::select! { biased;
-                                    _ = cancel.cancelled() => Some((Err(NetworkError::Cancelled), (stream, cancel, true))),
+                                    _ = cancel.cancelled() => Some((Err(NetworkError::Cancelled), (stream, cancel, true, permit))),
                                     item = stream.next() => item.map(|item| {
                                         let item = item.map_err(|e| if e.is_timeout() { NetworkError::Timeout } else { NetworkError::Transport });
                                         let done = item.is_err();
-                                        (item, (stream, cancel, done))
+                                        (item, (stream, cancel, done, permit))
                                     })
                                 }
                             },
                         );
-                        return Ok(Box::pin(output));
+                        return Ok(HttpResponse {
+                            status: status.as_u16(),
+                            headers,
+                            body: Box::pin(output),
+                        });
                     }
                     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
                         return Err(NetworkError::Unauthorized);
                     }
                     let retryable =
                         status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
-                    if !retryable || attempt >= self.config.max_retries {
+                    if !retryable || method != Method::GET || attempt >= self.config.max_retries {
                         return Err(if status == StatusCode::TOO_MANY_REQUESTS {
                             NetworkError::RateLimited
                         } else {
                             NetworkError::Http(status.as_u16())
                         });
                     }
-                    retry_after = response
+                    response
                         .headers()
                         .get(header::RETRY_AFTER)
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.parse::<u64>().ok())
-                        .map(Duration::from_secs);
+                        .map(Duration::from_secs)
                 }
                 Err(e) => {
-                    if attempt >= self.config.max_retries {
+                    if method != Method::GET || attempt >= self.config.max_retries {
                         return Err(if e.is_timeout() {
                             NetworkError::Timeout
                         } else {
                             NetworkError::Transport
                         });
                     }
-                    retry_after = None;
+                    None
                 }
-            }
+            };
             let exponential = self
                 .config
                 .backoff
                 .saturating_mul(2_u32.saturating_pow(attempt));
+            if retry_after.is_some_and(|delay| delay > self.config.max_backoff) {
+                return Err(NetworkError::RateLimited);
+            }
             let delay = retry_after
                 .unwrap_or(exponential)
                 .min(self.config.max_backoff);
             attempt += 1;
             tokio::select! { biased; _ = cancel.cancelled() => return Err(NetworkError::Cancelled), _ = tokio::time::sleep(delay) => {} }
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl Transport for HttpTransport {
+    async fn send(
+        &self,
+        method: Method,
+        url: &Url,
+        headers: header::HeaderMap,
+        body: Option<Bytes>,
+        range: Option<ByteRange>,
+        cancel: CancellationToken,
+    ) -> Result<HttpResponse, NetworkError> {
+        self.request(method, url, headers, body, range, cancel)
+            .await
     }
 }
 

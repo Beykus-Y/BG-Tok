@@ -75,7 +75,7 @@ async fn cancellation_interrupts_waiting_body() {
     let task = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut request = [0; 4096];
-        socket.read(&mut request).await.unwrap();
+        assert!(socket.read(&mut request).await.unwrap() > 0);
         socket
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
             .await
@@ -98,4 +98,70 @@ fn proxy_credentials_are_not_debugged() {
         ..Default::default()
     };
     assert!(!format!("{config:?}").contains("secret"));
+}
+
+#[tokio::test]
+async fn honors_retry_after_beyond_budget_without_retrying_early() {
+    let (url, task) = server(vec!["HTTP/1.1 429 Too Many Requests\r\nRetry-After: 100\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"]).await;
+    assert!(matches!(
+        transport().get(&url, None, CancellationToken::new()).await,
+        Err(NetworkError::RateLimited)
+    ));
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn post_is_not_retried_and_does_not_expose_url() {
+    let (url, task) = server(vec![
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ])
+    .await;
+    let result = transport()
+        .request(
+            reqwest::Method::POST,
+            &url,
+            reqwest::header::HeaderMap::new(),
+            Some("synthetic".into()),
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    match result {
+        Err(error) => {
+            assert!(matches!(error, NetworkError::Http(503)));
+            assert!(!error.to_string().contains("not-real"));
+        }
+        Ok(_) => panic!("expected error"),
+    }
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_while_waiting_for_capacity() {
+    let (url, task) = server(vec![
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
+    ])
+    .await;
+    let client = HttpTransport::new(HttpConfig {
+        max_in_flight: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let stream = client
+        .get(&url, None, CancellationToken::new())
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let waiting = tokio::spawn({
+        let client = client.clone();
+        let cancel = cancel.clone();
+        async move { client.get(&url, None, cancel).await }
+    });
+    cancel.cancel();
+    assert!(matches!(
+        waiting.await.unwrap(),
+        Err(NetworkError::Cancelled)
+    ));
+    drop(stream);
+    task.await.unwrap();
 }

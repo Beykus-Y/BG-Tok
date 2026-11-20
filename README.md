@@ -1,18 +1,22 @@
 # BG Tok
 
-Rust foundation for a TikTok content provider hosted by BeyGram. This repository
-is at feasibility stage: it does **not** provide login, a feed, playback, or a
-C ABI yet. The personalized feed is gated on evidence of authorized access; see
-[feasibility](docs/feasibility.md) and [architecture](docs/architecture.md).
+Rust provider-independent primitives for BeyGram, with a separate synthetic
+provider and CLI. There is no real TikTok provider, login, player or C ABI yet.
+The requirements for real service access are in [feasibility](docs/feasibility.md).
+See [architecture](docs/architecture.md) for the current interfaces and limits.
 
 ## Development
 
-Install stable Rust with rustfmt and clippy, then run:
+Install stable Rust with rustfmt and clippy:
 
 ```sh
+cargo check --workspace --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
+cargo run -p bg-tok-mock
 ```
 
-Tests use no service accounts or network access.
+The mock package is a separate workspace member, excluded from the default
+build and from the core's dependencies. The CLI uses only synthetic data. Tests
+use local loopback HTTP servers, never service accounts or the TikTok network.
