@@ -139,6 +139,7 @@ async fn switch_and_logout_cancel_old_work_and_isolate_credentials() {
 struct DelayedProvider {
     started: Notify,
     calls: AtomicUsize,
+    read_token: Mutex<Option<CancellationToken>>,
 }
 #[async_trait]
 impl ContentProvider for DelayedProvider {
@@ -170,9 +171,10 @@ impl ContentProvider for DelayedProvider {
         &self,
         _: &Source,
         _: Option<ByteRange>,
-        _: CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<MediaStream, ProviderError> {
-        Err(ProviderError::Unsupported)
+        *self.read_token.lock().await = Some(cancel);
+        Ok(Box::pin(futures_util::stream::pending()))
     }
     async fn action(
         &self,
@@ -199,6 +201,7 @@ async fn close_interrupts_pending_provider_and_does_not_commit_page() {
     let provider = Arc::new(DelayedProvider {
         started: Notify::new(),
         calls: AtomicUsize::new(0),
+        read_token: Mutex::new(None),
     });
     let feed = Arc::new(Feed::new(provider.clone(), FeedKind::Recommended, 10));
     let handle = tokio::spawn({
@@ -215,4 +218,48 @@ async fn close_interrupts_pending_provider_and_does_not_commit_page() {
         Err(ProviderError::SessionClosed)
     );
     assert!(feed.snapshot().await.is_empty());
+}
+
+#[tokio::test]
+async fn rejects_chunk_larger_than_host_budget() {
+    let provider = Arc::new(MockProvider::default());
+    let source = provider
+        .sources(&id("one"), CancellationToken::new())
+        .await
+        .unwrap()
+        .remove(0);
+    let delivery = MediaDelivery::with_chunk_limit(provider, CancellationToken::new(), 4);
+    let mut stream = delivery
+        .open(&id("one"), source, None, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(ProviderError::Capacity))
+    ));
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn dropping_media_stream_cancels_provider_work() {
+    let provider = Arc::new(DelayedProvider {
+        started: Notify::new(),
+        calls: AtomicUsize::new(0),
+        read_token: Mutex::new(None),
+    });
+    let source = Source {
+        id: "synthetic".into(),
+        mime_type: "application/octet-stream".into(),
+        expires_at: None,
+        cache: bg_tok::provider::CachePolicy::NoStore,
+    };
+    let delivery = MediaDelivery::new(provider.clone(), CancellationToken::new());
+    let stream = delivery
+        .open(&id("one"), source, None, CancellationToken::new())
+        .await
+        .unwrap();
+    let token = provider.read_token.lock().await.clone().unwrap();
+    assert!(!token.is_cancelled());
+    drop(stream);
+    assert!(token.is_cancelled());
 }

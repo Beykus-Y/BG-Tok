@@ -261,12 +261,32 @@ impl HttpTransport {
                             NetworkError::Http(status.as_u16())
                         });
                     }
-                    response
-                        .headers()
-                        .get(header::RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .map(Duration::from_secs)
+                    match response.headers().get(header::RETRY_AFTER) {
+                        Some(value) => {
+                            let parsed = value.to_str().ok().and_then(|text| {
+                                text.parse::<u64>()
+                                    .ok()
+                                    .map(Duration::from_secs)
+                                    .or_else(|| {
+                                        httpdate::parse_http_date(text).ok().map(|date| {
+                                            date.duration_since(std::time::SystemTime::now())
+                                                .unwrap_or_default()
+                                        })
+                                    })
+                            });
+                            match parsed {
+                                Some(delay) if delay <= self.config.max_backoff => Some(delay),
+                                _ => {
+                                    return Err(if status == StatusCode::TOO_MANY_REQUESTS {
+                                        NetworkError::RateLimited
+                                    } else {
+                                        NetworkError::Http(status.as_u16())
+                                    })
+                                }
+                            }
+                        }
+                        None => None,
+                    }
                 }
                 Err(e) => {
                     if method != Method::GET || attempt >= self.config.max_retries {
@@ -283,9 +303,6 @@ impl HttpTransport {
                 .config
                 .backoff
                 .saturating_mul(2_u32.saturating_pow(attempt));
-            if retry_after.is_some_and(|delay| delay > self.config.max_backoff) {
-                return Err(NetworkError::RateLimited);
-            }
             let delay = retry_after
                 .unwrap_or(exponential)
                 .min(self.config.max_backoff);

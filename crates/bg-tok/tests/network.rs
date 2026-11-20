@@ -165,3 +165,34 @@ async fn cancellation_while_waiting_for_capacity() {
     drop(stream);
     task.await.unwrap();
 }
+
+#[tokio::test]
+async fn timeout_is_reported_without_leaking_request_url() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/?token=synthetic-secret",
+        listener.local_addr().unwrap()
+    )
+    .parse()
+    .unwrap();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let _ = socket.read(&mut request).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    });
+    let client = HttpTransport::new(HttpConfig {
+        request_timeout: Duration::from_millis(50),
+        max_retries: 0,
+        ..Default::default()
+    })
+    .unwrap();
+    match client.get(&url, None, CancellationToken::new()).await {
+        Err(e) => {
+            assert!(matches!(e, NetworkError::Timeout));
+            assert!(!e.to_string().contains("synthetic-secret"));
+        }
+        Ok(_) => panic!("expected timeout"),
+    }
+    task.abort();
+}

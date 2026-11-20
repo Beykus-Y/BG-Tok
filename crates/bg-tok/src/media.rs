@@ -10,10 +10,23 @@ use tokio_util::sync::CancellationToken;
 pub struct MediaDelivery<P: ContentProvider + ?Sized> {
     provider: Arc<P>,
     session: CancellationToken,
+    max_chunk_bytes: usize,
 }
 impl<P: ContentProvider + ?Sized> MediaDelivery<P> {
     pub fn new(provider: Arc<P>, session: CancellationToken) -> Self {
-        Self { provider, session }
+        Self::with_chunk_limit(provider, session, 1024 * 1024)
+    }
+    /// Limits each chunk passed to the host. Providers must also bound their own buffers.
+    pub fn with_chunk_limit(
+        provider: Arc<P>,
+        session: CancellationToken,
+        max_chunk_bytes: usize,
+    ) -> Self {
+        Self {
+            provider,
+            session,
+            max_chunk_bytes,
+        }
     }
     /// Refresh an expired handle once before starting the body. The provider
     /// must return the same stable source ID; the host can reselect otherwise.
@@ -25,6 +38,7 @@ impl<P: ContentProvider + ?Sized> MediaDelivery<P> {
         cancel: CancellationToken,
     ) -> Result<MediaStream, ProviderError> {
         let operation = cancel.child_token();
+        let guard = operation.clone().drop_guard();
         let mut refreshed = false;
         loop {
             if source
@@ -47,16 +61,17 @@ impl<P: ContentProvider + ?Sized> MediaDelivery<P> {
                 Err(error) => return Err(error),
                 Ok(stream) => {
                     let session = self.session.clone();
+                    let limit = self.max_chunk_bytes;
                     let output = futures_util::stream::unfold(
-                        (stream, session, cancel, operation, false),
-                        |(mut stream, session, cancel, operation, done)| async move {
+                        (stream, session, cancel, operation, false, guard),
+                        move |(mut stream, session, cancel, operation, done, guard)| async move {
                             if done {
                                 return None;
                             }
                             tokio::select! { biased;
-                                _ = session.cancelled() => { operation.cancel(); Some((Err(ProviderError::SessionClosed), (stream, session, cancel, operation, true))) },
-                                _ = cancel.cancelled() => { operation.cancel(); Some((Err(ProviderError::Cancelled), (stream, session, cancel, operation, true))) },
-                                item = stream.next() => item.map(|item| { let done = item.is_err(); (item, (stream, session, cancel, operation, done)) })
+                                _ = session.cancelled() => { operation.cancel(); Some((Err(ProviderError::SessionClosed), (stream, session, cancel, operation, true, guard))) },
+                                _ = cancel.cancelled() => { operation.cancel(); Some((Err(ProviderError::Cancelled), (stream, session, cancel, operation, true, guard))) },
+                                item = stream.next() => item.map(|item| { let item = item.and_then(|bytes| if bytes.len() > limit { Err(ProviderError::Capacity) } else { Ok(bytes) }); let done = item.is_err(); (item, (stream, session, cancel, operation, done, guard)) })
                             }
                         },
                     );

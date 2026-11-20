@@ -105,6 +105,7 @@ pub type MediaStream = Pin<Box<dyn Stream<Item = Result<Bytes, ProviderError>> +
 
 /// Implementations must respect cancellation, avoid logging secrets and keep
 /// account credentials internal. Fetches are initiated solely by the host.
+/// Implementations must bound their own buffers and honor backpressure.
 #[async_trait]
 pub trait ContentProvider: Send + Sync {
     fn capabilities(&self) -> Capabilities;

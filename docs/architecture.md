@@ -15,7 +15,7 @@ host requests them and no playback event is inferred from fetching.
   sensitive URL mappings internally. These Rust interfaces are provisional,
   not a stable or agreed C ABI.
 * `Feed` serializes page loads, preserves order, deduplicates IDs, detects cursor
-  cycles and retains a bounded number of metadata items. Failed pages do not
+  cycles and bounds retained cursors and metadata items. Failed pages do not
   advance the cursor. Index lookup is not a presentation queue. Closing a feed
   or cancelling its parent session aborts pending work; an individual call can
   also be cancelled. A host should discard old snapshots on account switch.
@@ -26,8 +26,10 @@ host requests them and no playback event is inferred from fetching.
   revocation separately where available. In-memory test storage is not secure.
 * `MediaDelivery` opens only requested streams and refreshes an expired source
   once before streaming. A stream is pull-driven, cancels on session or request
-  cancellation, and is dropped by the consumer. Errors after the first byte are
-  returned without automatic replay. The host controls caching and backpressure.
+  cancellation; dropping it cancels provider work. The default delivery limit
+  is 1 MiB per chunk (configurable); an oversized chunk fails. Providers must
+  independently bound their buffers. Errors after the first byte are returned
+  without automatic replay. The host controls caching and backpressure.
 * `HttpTransport` provides HTTP(S), explicit HTTP(S)/SOCKS proxy configuration,
   bounded concurrency, per-attempt deadlines, cancellation and bounded retry
   of GET before body delivery. Other methods are never automatically retried.

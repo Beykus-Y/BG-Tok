@@ -67,6 +67,7 @@ impl<P: ContentProvider + ?Sized> Feed<P> {
             state.cursor.clone()
         };
         let operation = cancel.child_token();
+        let _guard = operation.clone().drop_guard();
         let page = tokio::select! { biased; _ = self.closed.cancelled() => { operation.cancel(); return Err(ProviderError::SessionClosed) }, _ = cancel.cancelled() => { operation.cancel(); return Err(ProviderError::Cancelled) }, result = self.provider.page(&self.kind, cursor.as_deref(), operation.clone()) => result? };
         let mut state = self.state.lock().await;
         if self.closed.is_cancelled() {
@@ -76,6 +77,9 @@ impl<P: ContentProvider + ?Sized> Feed<P> {
             return Err(ProviderError::Cancelled);
         }
         if let Some(next) = &page.next_cursor {
+            if state.cursors.len() >= self.capacity {
+                return Err(ProviderError::Capacity);
+            }
             if state.cursors.contains(next) || cursor.as_ref() == Some(next) {
                 return Err(ProviderError::InvalidResponse);
             }
