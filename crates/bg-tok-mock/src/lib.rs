@@ -10,7 +10,7 @@ use bg_tok::{
 };
 use bytes::Bytes;
 use std::{
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     time::{Duration, SystemTime},
 };
 use tokio::sync::Mutex;
@@ -37,11 +37,27 @@ fn metadata(value: &str) -> Metadata {
 pub struct MockProvider {
     closed: AtomicBool,
     calls: AtomicUsize,
+    delay_ms: AtomicU64,
+    cycle_cursor: AtomicBool,
+    next_page_error: Mutex<Option<ProviderError>>,
     events: Mutex<Vec<(ContentId, PlaybackEvent)>>,
 }
 impl MockProvider {
     pub fn page_calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+    /// Inject one synthetic page failure, useful for testing recovery.
+    pub async fn fail_next_page(&self, error: ProviderError) {
+        *self.next_page_error.lock().await = Some(error);
+    }
+    pub fn set_cursor_cycle(&self, enabled: bool) {
+        self.cycle_cursor.store(enabled, Ordering::SeqCst);
+    }
+    pub fn set_page_delay(&self, delay: Duration) {
+        self.delay_ms.store(
+            delay.as_millis().min(u64::MAX as u128) as u64,
+            Ordering::SeqCst,
+        );
     }
     pub async fn events(&self) -> Vec<(ContentId, PlaybackEvent)> {
         self.events.lock().await.clone()
@@ -76,6 +92,18 @@ impl ContentProvider for MockProvider {
     ) -> Result<Page, ProviderError> {
         self.check(&cancel)?;
         self.calls.fetch_add(1, Ordering::SeqCst);
+        let delay = Duration::from_millis(self.delay_ms.load(Ordering::SeqCst));
+        tokio::select! { biased; _ = cancel.cancelled() => return Err(ProviderError::Cancelled), _ = tokio::time::sleep(delay) => {} }
+        self.check(&cancel)?;
+        if let Some(error) = self.next_page_error.lock().await.take() {
+            return Err(error);
+        }
+        if self.cycle_cursor.load(Ordering::SeqCst) {
+            return Ok(Page {
+                items: vec![],
+                next_cursor: Some("cycle".into()),
+            });
+        }
         if let FeedKind::Search(query) = kind {
             return Ok(Page {
                 items: ["one", "two", "three"]

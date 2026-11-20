@@ -17,8 +17,9 @@ host requests them and no playback event is inferred from fetching.
 * `Feed` serializes page loads, preserves order, deduplicates IDs, detects cursor
   cycles and bounds retained cursors and metadata items. Failed pages do not
   advance the cursor. Index lookup is not a presentation queue. Closing a feed
-  or cancelling its parent session aborts pending work; an individual call can
-  also be cancelled. A host should discard old snapshots on account switch.
+  or cancelling its parent session aborts pending work and hides retained items
+  from subsequent lookups; an individual call can also be cancelled. A host
+  must discard snapshots already obtained on account switch.
 * `Accounts` delegates storage to a host `SecureStore`. Session secrets are
   zeroed on drop; hosts must also protect any copies made by their storage or
   providers. Switching accounts cancels the previous session. Logout cancels
@@ -33,7 +34,7 @@ host requests them and no playback event is inferred from fetching.
 * `HttpTransport` provides HTTP(S), explicit HTTP(S)/SOCKS proxy configuration,
   bounded concurrency, per-attempt deadlines, cancellation and bounded retry
   of GET before body delivery. Other methods are never automatically retried.
-  A valid range response is required for range requests. Response chunks are
+  A valid range response and matching body length are required for range requests. Response chunks are
   transport-sized, not a fixed maximum; consumers must impose any required
   byte budget and must not collect arbitrary streams in memory. HTTP response
   headers and request data can be sensitive and must not be logged.

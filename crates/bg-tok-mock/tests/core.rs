@@ -121,8 +121,11 @@ async fn switch_and_logout_cancel_old_work_and_isolate_credentials() {
         10,
         active_a.cancellation.clone(),
     );
+    feed.load_next(CancellationToken::new()).await.unwrap();
     let active_b = accounts.activate(&b).await.unwrap();
     assert!(active_a.cancellation.is_cancelled());
+    assert!(feed.snapshot().await.is_empty());
+    assert!(feed.get(0).await.is_none());
     assert_eq!(
         feed.load_next(CancellationToken::new()).await,
         Err(ProviderError::SessionClosed)
@@ -262,4 +265,31 @@ async fn dropping_media_stream_cancels_provider_work() {
     assert!(!token.is_cancelled());
     drop(stream);
     assert!(token.is_cancelled());
+}
+
+#[tokio::test]
+async fn transient_page_failure_can_be_retried_without_skipping_items() {
+    let provider = Arc::new(MockProvider::default());
+    let feed = Feed::new(provider.clone(), FeedKind::Recommended, 10);
+    provider.fail_next_page(ProviderError::RateLimited).await;
+    assert_eq!(
+        feed.load_next(CancellationToken::new()).await,
+        Err(ProviderError::RateLimited)
+    );
+    assert!(feed.snapshot().await.is_empty());
+    assert_eq!(feed.load_next(CancellationToken::new()).await.unwrap(), 2);
+    assert_eq!(feed.get(0).await.unwrap().id, id("one"));
+}
+
+#[tokio::test]
+async fn cyclic_cursor_is_rejected_without_advancing() {
+    let provider = Arc::new(MockProvider::default());
+    provider.set_cursor_cycle(true);
+    let feed = Feed::new(provider, FeedKind::Recommended, 10);
+    assert_eq!(feed.load_next(CancellationToken::new()).await.unwrap(), 0);
+    assert_eq!(
+        feed.load_next(CancellationToken::new()).await,
+        Err(ProviderError::InvalidResponse)
+    );
+    assert!(!feed.exhausted().await);
 }

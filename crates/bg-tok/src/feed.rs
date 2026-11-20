@@ -51,11 +51,21 @@ impl<P: ContentProvider + ?Sized> Feed<P> {
         self.closed.cancel();
     }
     pub async fn snapshot(&self) -> Vec<Metadata> {
-        self.state.lock().await.items.clone()
+        let state = self.state.lock().await;
+        if self.closed.is_cancelled() {
+            Vec::new()
+        } else {
+            state.items.clone()
+        }
     }
     /// Index lookup is metadata only; no playback or byte transfer is started.
     pub async fn get(&self, index: usize) -> Option<Metadata> {
-        self.state.lock().await.items.get(index).cloned()
+        let state = self.state.lock().await;
+        if self.closed.is_cancelled() {
+            None
+        } else {
+            state.items.get(index).cloned()
+        }
     }
     pub async fn load_next(&self, cancel: CancellationToken) -> Result<usize, ProviderError> {
         let _guard = tokio::select! { biased; _ = self.closed.cancelled() => return Err(ProviderError::SessionClosed), _ = cancel.cancelled() => return Err(ProviderError::Cancelled), guard = self.loading.lock() => guard };

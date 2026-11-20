@@ -191,7 +191,10 @@ impl HttpTransport {
         if let Some(r) = range {
             ByteRange::new(r.start, r.end)?;
         }
-        let permit = tokio::select! { biased; _ = cancel.cancelled() => return Err(NetworkError::Cancelled), p = self.permits.clone().acquire_owned() => p.map_err(|_| NetworkError::Transport)? };
+        let permit = tokio::select! { biased;
+            _ = cancel.cancelled() => return Err(NetworkError::Cancelled),
+            p = tokio::time::timeout(self.config.request_timeout, self.permits.clone().acquire_owned()) => p.map_err(|_| NetworkError::Timeout)?.map_err(|_| NetworkError::Transport)?
+        };
         let mut attempt = 0;
         loop {
             let mut request = self
@@ -211,35 +214,60 @@ impl HttpTransport {
                 Ok(response) => {
                     let status = response.status();
                     if status.is_success() {
-                        if let Some(r) = range {
-                            if status != StatusCode::PARTIAL_CONTENT
-                                || !valid_content_range(
-                                    response
-                                        .headers()
-                                        .get(header::CONTENT_RANGE)
-                                        .and_then(|v| v.to_str().ok()),
-                                    r,
-                                )
+                        let expected = if let Some(r) = range {
+                            if status != StatusCode::PARTIAL_CONTENT {
+                                return Err(NetworkError::InvalidRange);
+                            }
+                            if response
+                                .headers()
+                                .get(header::CONTENT_ENCODING)
+                                .is_some_and(|value| value.as_bytes() != b"identity")
                             {
                                 return Err(NetworkError::InvalidRange);
                             }
-                        }
+                            let length = content_range_len(
+                                response
+                                    .headers()
+                                    .get(header::CONTENT_RANGE)
+                                    .and_then(|v| v.to_str().ok()),
+                                r,
+                            )
+                            .ok_or(NetworkError::InvalidRange)?;
+                            if response.content_length().is_some_and(|size| size != length) {
+                                return Err(NetworkError::InvalidRange);
+                            }
+                            Some(length)
+                        } else {
+                            None
+                        };
                         let headers = response.headers().clone();
                         let stream = response.bytes_stream();
                         let cancelled = cancel.clone();
                         let output = futures_util::stream::unfold(
-                            (stream, cancelled, false, permit),
-                            |(mut stream, cancel, done, permit)| async move {
+                            (stream, cancelled, false, permit, expected),
+                            |(mut stream, cancel, done, permit, mut remaining)| async move {
                                 if done {
                                     return None;
                                 }
                                 tokio::select! { biased;
-                                    _ = cancel.cancelled() => Some((Err(NetworkError::Cancelled), (stream, cancel, true, permit))),
-                                    item = stream.next() => item.map(|item| {
-                                        let item = item.map_err(|e| if e.is_timeout() { NetworkError::Timeout } else { NetworkError::Transport });
-                                        let done = item.is_err();
-                                        (item, (stream, cancel, done, permit))
-                                    })
+                                    _ = cancel.cancelled() => Some((Err(NetworkError::Cancelled), (stream, cancel, true, permit, remaining))),
+                                    item = stream.next() => {
+                                        match item {
+                                            Some(item) => {
+                                                let item = item.map_err(|e| if e.is_timeout() { NetworkError::Timeout } else { NetworkError::Transport }).and_then(|bytes| {
+                                                    if let Some(left) = remaining {
+                                                        if bytes.len() as u64 > left { return Err(NetworkError::InvalidRange); }
+                                                        remaining = Some(left - bytes.len() as u64);
+                                                    }
+                                                    Ok(bytes)
+                                                });
+                                                let done = item.is_err();
+                                                Some((item, (stream, cancel, done, permit, remaining)))
+                                            },
+                                            None if remaining.is_some_and(|left| left != 0) => Some((Err(NetworkError::InvalidRange), (stream, cancel, true, permit, remaining))),
+                                            None => None,
+                                        }
+                                    }
                                 }
                             },
                         );
@@ -328,28 +356,29 @@ impl Transport for HttpTransport {
     }
 }
 
-fn valid_content_range(value: Option<&str>, requested: ByteRange) -> bool {
-    let Some((range, total)) = value
+fn content_range_len(value: Option<&str>, requested: ByteRange) -> Option<u64> {
+    let (range, total) = value
         .and_then(|v| v.strip_prefix("bytes "))
-        .and_then(|v| v.split_once('/'))
-    else {
-        return false;
-    };
-    let Some((start, end)) = range.split_once('-') else {
-        return false;
-    };
+        .and_then(|v| v.split_once('/'))?;
+    let (start, end) = range.split_once('-')?;
     let (Ok(start), Ok(end), Ok(total)) = (
         start.parse::<u64>(),
         end.parse::<u64>(),
         total.parse::<u64>(),
     ) else {
-        return false;
+        return None;
     };
-    start == requested.start
+    if start == requested.start
         && end >= start
         && end < total
         && requested
             .end
             .is_none_or(|wanted| end == wanted.min(total - 1))
         && (requested.end.is_some() || end == total - 1)
+    {
+        end.checked_sub(start)
+            .and_then(|length| length.checked_add(1))
+    } else {
+        None
+    }
 }

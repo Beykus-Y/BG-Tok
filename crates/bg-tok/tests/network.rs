@@ -196,3 +196,59 @@ async fn timeout_is_reported_without_leaking_request_url() {
     }
     task.abort();
 }
+
+#[tokio::test]
+async fn rejects_malformed_content_range() {
+    let (url, task) = server(vec!["HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-5/10\r\nContent-Length: 3\r\nConnection: close\r\n\r\ndef"]).await;
+    assert!(matches!(
+        transport()
+            .get(
+                &url,
+                Some(ByteRange::new(2, Some(4)).unwrap()),
+                CancellationToken::new()
+            )
+            .await,
+        Err(NetworkError::InvalidRange)
+    ));
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn rejects_range_with_inconsistent_body_length() {
+    let (url, task) = server(vec!["HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-4/10\r\nContent-Length: 2\r\nConnection: close\r\n\r\ncd"]).await;
+    assert!(matches!(
+        transport()
+            .get(
+                &url,
+                Some(ByteRange::new(2, Some(4)).unwrap()),
+                CancellationToken::new()
+            )
+            .await,
+        Err(NetworkError::InvalidRange)
+    ));
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn waiting_for_a_busy_transport_times_out() {
+    let (url, task) = server(vec![
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
+    ])
+    .await;
+    let client = HttpTransport::new(HttpConfig {
+        max_in_flight: 1,
+        request_timeout: Duration::from_millis(100),
+        ..Default::default()
+    })
+    .unwrap();
+    let stream = client
+        .get(&url, None, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(matches!(
+        client.get(&url, None, CancellationToken::new()).await,
+        Err(NetworkError::Timeout)
+    ));
+    drop(stream);
+    task.await.unwrap();
+}
