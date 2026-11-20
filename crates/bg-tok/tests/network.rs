@@ -252,3 +252,36 @@ async fn waiting_for_a_busy_transport_times_out() {
     drop(stream);
     task.await.unwrap();
 }
+
+#[tokio::test]
+async fn routes_http_through_host_configured_proxy() {
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = proxy.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let n = socket.read(&mut request).await.unwrap();
+        let first_line = std::str::from_utf8(&request[..n])
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap();
+        assert!(first_line.starts_with("GET http://example.invalid/test HTTP/1.1"));
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+    });
+    let client = HttpTransport::new(HttpConfig {
+        proxy: Some(proxy_url),
+        ..Default::default()
+    })
+    .unwrap();
+    let url = "http://example.invalid/test".parse().unwrap();
+    let mut response = client
+        .get(&url, None, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(response.next().await.unwrap().unwrap(), "ok");
+    task.await.unwrap();
+}
