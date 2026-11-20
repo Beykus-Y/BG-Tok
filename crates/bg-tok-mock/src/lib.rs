@@ -138,6 +138,9 @@ impl ContentProvider for MockProvider {
         Ok(vec![Source {
             id: id.value.clone(),
             mime_type: "application/octet-stream".into(),
+            width: None,
+            height: None,
+            bitrate_bps: None,
             expires_at: Some(SystemTime::now() + Duration::from_secs(60)),
             cache: CachePolicy::NoStore,
         }])

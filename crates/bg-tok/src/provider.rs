@@ -41,6 +41,10 @@ pub enum FeedKind {
 pub struct Source {
     pub id: String,
     pub mime_type: String,
+    /// Optional video dimensions and bitrate, when supplied by the service.
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub bitrate_bps: Option<u64>,
     pub expires_at: Option<SystemTime>,
     pub cache: CachePolicy,
 }
