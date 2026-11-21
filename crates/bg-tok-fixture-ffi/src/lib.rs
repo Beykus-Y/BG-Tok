@@ -23,6 +23,11 @@ pub struct Host {
     items: Vec<ContentId>,
 }
 #[no_mangle]
+/// Create a test host from `count` NUL-terminated Linux paths.
+///
+/// # Safety
+/// `paths` must point to `count` readable pointers to valid NUL-terminated
+/// strings for the duration of the call. Calls must be made outside Tokio.
 pub unsafe extern "C" fn bg_tok_fixture_create(
     paths: *const *const c_char,
     count: usize,
@@ -80,6 +85,9 @@ pub unsafe extern "C" fn bg_tok_fixture_create(
     .unwrap_or(std::ptr::null_mut())
 }
 #[no_mangle]
+/// # Safety
+/// `host` must be null or a live host returned by `bg_tok_fixture_create`.
+/// Calls involving the same host must be serialized against all host calls.
 pub unsafe extern "C" fn bg_tok_fixture_count(host: *const Host) -> usize {
     catch_unwind(AssertUnwindSafe(|| {
         unsafe { host.as_ref() }.map_or(0, |h| h.items.len())
@@ -87,6 +95,9 @@ pub unsafe extern "C" fn bg_tok_fixture_count(host: *const Host) -> usize {
     .unwrap_or(0)
 }
 #[no_mangle]
+/// # Safety
+/// `host` must be null or a live host returned by `bg_tok_fixture_create`.
+/// Calls involving the same host must be serialized against all host calls.
 pub unsafe extern "C" fn bg_tok_fixture_read_calls(host: *const Host) -> u64 {
     catch_unwind(AssertUnwindSafe(|| {
         unsafe { host.as_ref() }.map_or(0, |h| h.provider.read_calls() as u64)
@@ -94,6 +105,10 @@ pub unsafe extern "C" fn bg_tok_fixture_read_calls(host: *const Host) -> u64 {
     .unwrap_or(0)
 }
 #[no_mangle]
+/// # Safety
+/// `host` must be null or a live host, with host calls serialized. If `out`
+/// is non-null and `capacity` is sufficient, it must point to writable storage
+/// of at least `capacity` bytes. Call outside Tokio worker threads.
 pub unsafe extern "C" fn bg_tok_fixture_revision(
     host: *mut Host,
     index: usize,
@@ -130,6 +145,11 @@ pub unsafe extern "C" fn bg_tok_fixture_revision(
     .unwrap_or(0)
 }
 #[no_mangle]
+/// # Safety
+/// `host` must be null or a live host, with host calls serialized. If non-null,
+/// `out` must be aligned and writable for one `RangeV1`. On success its
+/// context is transferred to the caller, who must release it exactly once
+/// after all reads finish. Call outside Tokio worker threads.
 pub unsafe extern "C" fn bg_tok_fixture_open(
     host: *mut Host,
     index: usize,
@@ -174,6 +194,9 @@ pub unsafe extern "C" fn bg_tok_fixture_open(
     .unwrap_or(4)
 }
 #[no_mangle]
+/// # Safety
+/// `host` must be null or a live host returned by `bg_tok_fixture_create`.
+/// Calls involving the same host must be serialized against all host calls.
 pub unsafe extern "C" fn bg_tok_fixture_cancel(host: *mut Host) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if let Some(host) = unsafe { host.as_mut() } {
@@ -182,6 +205,10 @@ pub unsafe extern "C" fn bg_tok_fixture_cancel(host: *mut Host) {
     }));
 }
 #[no_mangle]
+/// # Safety
+/// `host` must be null or a live host returned by `bg_tok_fixture_create`,
+/// and may be destroyed only once. Serialize with other calls on the host.
+/// Destruction must occur outside Tokio worker threads.
 pub unsafe extern "C" fn bg_tok_fixture_destroy(host: *mut Host) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if !host.is_null() {
