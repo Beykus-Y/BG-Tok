@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+default = []
+experimental-companion = []
+
 [dependencies]
 async-trait = "0.1"
 bg-tok = { path = "../bg-tok" }

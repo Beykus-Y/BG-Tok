@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+#[cfg(feature = "experimental-companion")]
+pub mod companion;
 pub mod error;
 pub mod models;
 pub mod parser;
