@@ -40,6 +40,7 @@ pub struct MockProvider {
     calls: AtomicUsize,
     delay_ms: AtomicU64,
     read_delay_ms: AtomicU64,
+    revision: AtomicU64,
     cycle_cursor: AtomicBool,
     next_page_error: Mutex<Option<ProviderError>>,
     events: Mutex<Vec<(ContentId, PlaybackEvent)>>,
@@ -73,6 +74,9 @@ impl MockProvider {
             delay.as_millis().min(u64::MAX as u128) as u64,
             Ordering::SeqCst,
         );
+    }
+    pub fn set_revision(&self, revision: u64) {
+        self.revision.store(revision, Ordering::SeqCst);
     }
     pub async fn events(&self) -> Vec<(ContentId, PlaybackEvent)> {
         self.events.lock().await.clone()
@@ -153,6 +157,8 @@ impl ContentProvider for MockProvider {
         Ok(vec![Source {
             id: id.value.clone(),
             mime_type: "application/octet-stream".into(),
+            length: Some(self.media.as_ref().map_or(15, |data| data.len()) as u64),
+            revision: Some(self.revision.load(Ordering::SeqCst).to_string()),
             width: None,
             height: None,
             bitrate_bps: None,

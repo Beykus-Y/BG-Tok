@@ -45,7 +45,7 @@ struct Bridge {
 pub struct RangeSource(RangeV1);
 
 impl RangeSource {
-    /// The host supplies the verified size of an immutable representation.
+    /// The source must contain a verified size and immutable revision.
     /// Keep the I/O runtime running through release. Invoke the callbacks
     /// on non-Tokio threads, without holding UI or provider locks.
     pub fn new(
@@ -56,7 +56,12 @@ impl RangeSource {
         source: Source,
         length: u64,
     ) -> Result<Self, ProviderError> {
-        if length == 0 || length > i64::MAX as u64 || !provider.capabilities().ranges {
+        if length == 0
+            || length > i64::MAX as u64
+            || !provider.capabilities().ranges
+            || source.length != Some(length)
+            || source.revision.as_ref().is_none_or(|r| r.is_empty())
+        {
             return Err(ProviderError::Unsupported);
         }
         let context = Box::new(Bridge {
@@ -132,7 +137,10 @@ async fn read_chunk(
         .delivery
         .open_resolved(&bridge.id, original.clone(), Some(range), cancel)
         .await?;
-    if resolved.cache != original.cache {
+    if resolved.cache != original.cache
+        || resolved.length != original.length
+        || resolved.revision != original.revision
+    {
         return Err(ProviderError::SourceExpired);
     }
     {
@@ -229,6 +237,56 @@ mod tests {
         ptr,
         time::{Instant, SystemTime},
     };
+
+    #[test]
+    fn rejects_unverified_length_and_changed_revision_on_refresh() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let provider = Arc::new(MockProvider::default());
+        let item = id("one");
+        let mut source = runtime
+            .block_on(provider.sources(&item, CancellationToken::new()))
+            .unwrap()
+            .remove(0);
+        assert!(RangeSource::new(
+            runtime.handle().clone(),
+            provider.clone(),
+            CancellationToken::new(),
+            item.clone(),
+            source.clone(),
+            14
+        )
+        .is_err());
+        source.expires_at = Some(SystemTime::UNIX_EPOCH);
+        let range = RangeSource::new(
+            runtime.handle().clone(),
+            provider.clone(),
+            CancellationToken::new(),
+            item,
+            source,
+            15,
+        )
+        .unwrap();
+        provider.set_revision(1);
+        let mut output = [0; 5];
+        let raw = &range.0;
+        assert_eq!(
+            unsafe {
+                (raw.read_at)(
+                    raw.context,
+                    0,
+                    output.as_mut_ptr(),
+                    output.len(),
+                    1000,
+                    None,
+                    ptr::null_mut(),
+                )
+            },
+            EXPIRED
+        );
+    }
 
     #[test]
     fn large_abi_read_is_split_into_bounded_provider_reads() {

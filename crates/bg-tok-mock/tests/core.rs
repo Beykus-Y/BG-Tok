@@ -253,6 +253,8 @@ async fn dropping_media_stream_cancels_provider_work() {
     let source = Source {
         id: "synthetic".into(),
         mime_type: "application/octet-stream".into(),
+        length: None,
+        revision: None,
         width: None,
         height: None,
         bitrate_bps: None,

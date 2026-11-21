@@ -41,6 +41,10 @@ pub enum FeedKind {
 pub struct Source {
     pub id: String,
     pub mime_type: String,
+    /// Verified representation size, when the provider can establish it.
+    pub length: Option<u64>,
+    /// Opaque immutable representation identity. It must change with the bytes.
+    pub revision: Option<String>,
     /// Optional video dimensions and bitrate, when supplied by the service.
     pub width: Option<u32>,
     pub height: Option<u32>,
