@@ -1,0 +1,20 @@
+[package]
+name = "bg-tok-explore-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+bg-tok = { path = "../bg-tok" }
+bg-tok-range = { path = "../bg-tok-range" }
+bg-tok-tiktok = { path = "../bg-tok-tiktok" }
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+bg-tok-mock = { path = "../bg-tok-mock" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

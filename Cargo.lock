@@ -47,6 +47,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bg-tok-explore-ffi"
+version = "0.1.0"
+dependencies = [
+ "bg-tok",
+ "bg-tok-mock",
+ "bg-tok-range",
+ "bg-tok-tiktok",
+ "futures-util",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "bg-tok-file-fixture"
 version = "0.1.0"
 dependencies = [
@@ -92,6 +105,23 @@ dependencies = [
  "futures-util",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "bg-tok-tiktok"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bg-tok",
+ "bytes",
+ "futures-util",
+ "http",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -787,6 +817,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
