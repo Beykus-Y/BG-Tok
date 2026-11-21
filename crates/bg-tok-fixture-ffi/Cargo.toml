@@ -1,0 +1,15 @@
+[package]
+name = "bg-tok-fixture-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+bg-tok = { path = "../bg-tok" }
+bg-tok-range = { path = "../bg-tok-range" }
+bg-tok-file-fixture = { path = "../bg-tok-file-fixture" }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }

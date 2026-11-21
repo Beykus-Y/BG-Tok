@@ -60,6 +60,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bg-tok-fixture-ffi"
+version = "0.1.0"
+dependencies = [
+ "bg-tok",
+ "bg-tok-file-fixture",
+ "bg-tok-range",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "bg-tok-mock"
 version = "0.1.0"
 dependencies = [
