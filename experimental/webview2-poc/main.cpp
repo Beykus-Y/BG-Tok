@@ -47,6 +47,7 @@ constexpr int IDC_BTN_TOGGLE_VIS = 103;
 constexpr int IDC_BTN_MINIMIZE = 104;
 constexpr int IDC_BTN_RELOAD = 105;
 constexpr int IDC_BTN_CLEAR = 106;
+constexpr int IDC_BTN_DIAG = 109;
 constexpr int IDC_STATUS_TEXT = 107;
 constexpr int IDC_LOG_LIST = 108;
 constexpr UINT_PTR TIMER_METRICS = 1;
@@ -71,6 +72,13 @@ struct AppState {
     bool wv_visible = true;
     uint64_t heartbeat_count = 0;
     uint64_t hidden_heartbeats = 0;
+    uint64_t dom_mutations = 0;
+    uint64_t links_found = 0;
+    uint64_t cards_found = 0;
+    uint64_t cards_processed = 0;
+    uint64_t ads_count = 0;
+    uint64_t live_count = 0;
+    uint64_t unidentified_count = 0;
     std::set<std::wstring> seen_video_ids;
     std::vector<std::wstring> ordered_video_ids;
 
@@ -212,12 +220,19 @@ void UpdateMetrics() {
        << L" | JS vis: " << g_state.js_visibility
        << L"\r\nHeartbeats: " << g_state.heartbeat_count
        << L" (hidden: " << g_state.hidden_heartbeats << L")"
-       << L" | Feed IDs: " << g_state.ordered_video_ids.size()
+       << L" | Mutations: " << g_state.dom_mutations
+       << L"\r\nLinks: " << g_state.links_found
+       << L" | Cards: " << g_state.cards_found
+       << L" (proc: " << g_state.cards_processed << L")"
+       << L" | Unique IDs: " << g_state.ordered_video_ids.size()
+       << L"\r\nAds: " << g_state.ads_count
+       << L" | LIVE: " << g_state.live_count
+       << L" | Unidentified: " << g_state.unidentified_count
        << L"\r\nHost RAM: " << (static_cast<double>(host_ws) / (1024.0 * 1024.0)) << L" MB"
        << L" | WV2 (" << (all_pids.size() > 0 ? all_pids.size() - 1 : 0) << L" procs): "
        << (static_cast<double>(wv_ws) / (1024.0 * 1024.0)) << L" MB"
        << L" | CPU: " << g_state.last_cpu_pct << L"%"
-       << L"\r\nProfile size: " << profile_mb << L" MB";
+       << L" | Profile: " << profile_mb << L" MB";
 
     SetWindowTextW(g_state.status_hwnd, ss.str().c_str());
 }
@@ -248,8 +263,29 @@ bool ExtractJsonBool(const std::wstring& json, const std::wstring& key, bool def
     return default_val;
 }
 
+uint64_t ExtractJsonUint(const std::wstring& json, const std::wstring& key) {
+    std::wstring needle = L"\"" + key + L"\":";
+    size_t pos = json.find(needle);
+    if (pos == std::wstring::npos) return 0;
+    pos += needle.size();
+    uint64_t val = 0;
+    while (pos < json.size() && iswdigit(json[pos])) {
+        val = val * 10 + static_cast<uint64_t>(json[pos] - L'0');
+        pos++;
+    }
+    return val;
+}
+
+bool IsTrustedTikTokOrigin(const std::wstring& source) {
+    // Exact origin check: must be "https://www.tiktok.com" or "https://www.tiktok.com/..."
+    // Rejects lookalike hosts like "https://www.tiktok.com.evil.com/".
+    if (source == L"https://www.tiktok.com") return true;
+    const std::wstring prefix = L"https://www.tiktok.com/";
+    return source.size() >= prefix.size() && source.compare(0, prefix.size(), prefix) == 0;
+}
+
 void HandlePageMessage(const std::wstring& source, const std::wstring& raw_json) {
-    if (source.rfind(L"https://www.tiktok.com", 0) != 0) {
+    if (!IsTrustedTikTokOrigin(source)) {
         AddLog(L"[BLOCKED] Untrusted origin: " + source);
         return;
     }
@@ -267,17 +303,34 @@ void HandlePageMessage(const std::wstring& source, const std::wstring& raw_json)
         g_state.js_visibility = ExtractJsonString(raw_json, L"vis");
         bool logged_in = ExtractJsonBool(raw_json, L"loggedIn", false);
         g_state.auth_state = logged_in ? L"LOGGED_IN" : L"GUEST";
+    } else if (kind == L"scan_stats") {
+        g_state.dom_mutations = ExtractJsonUint(raw_json, L"mutations");
+        g_state.links_found = ExtractJsonUint(raw_json, L"links");
+        g_state.cards_found = ExtractJsonUint(raw_json, L"cards");
+        g_state.cards_processed = ExtractJsonUint(raw_json, L"processed");
+        g_state.ads_count = ExtractJsonUint(raw_json, L"ads");
+        g_state.live_count = ExtractJsonUint(raw_json, L"live");
+        g_state.unidentified_count = ExtractJsonUint(raw_json, L"unidentified");
     } else if (kind == L"feed_item") {
         std::wstring vid = ExtractJsonString(raw_json, L"id");
         std::wstring author = ExtractJsonString(raw_json, L"author");
         std::wstring title = ExtractJsonString(raw_json, L"title");
+        std::wstring item_type = ExtractJsonString(raw_json, L"itemType");
+        std::wstring src_kind = ExtractJsonString(raw_json, L"srcKind");
+        uint64_t dom_pos = ExtractJsonUint(raw_json, L"pos");
         if (!vid.empty() && std::all_of(vid.begin(), vid.end(), iswdigit)) {
             if (g_state.seen_video_ids.insert(vid).second) {
                 g_state.ordered_video_ids.push_back(vid);
                 std::wstring line = L"#" + std::to_wstring(g_state.ordered_video_ids.size()) +
-                                    L" [" + vid + L"] @" + author + L" - " + title.substr(0, 60);
+                                    L" (dom@" + std::to_wstring(dom_pos) + L"," + item_type + L"," + src_kind +
+                                    L") [" + vid + L"] @" + author + L" - " + title.substr(0, 48);
                 AddLog(line);
             }
+        }
+    } else if (kind == L"diag") {
+        std::wstring msg = ExtractJsonString(raw_json, L"msg");
+        if (!msg.empty()) {
+            AddLog(L"[DIAG] " + msg);
         }
     }
 }
@@ -287,39 +340,178 @@ const wchar_t* kObserverScript = LR"JS(
   if (window.__bgTokObserverInstalled) return;
   window.__bgTokObserverInstalled = true;
 
+  let mutations = 0;
+  let scanTimer = null;
+  let lastScanMs = 0;
+  const loggedDiagKeys = new Set();
+
+  function post(obj) {
+    if (window.chrome && window.chrome.webview) {
+      window.chrome.webview.postMessage(JSON.stringify(obj));
+    }
+  }
+
   function detectLoggedIn() {
     const loginBtn = document.querySelector('[data-e2e="top-login-button"]');
     const profile = document.querySelector('[data-e2e="profile-icon"], [data-e2e="nav-profile"]');
     return !!profile && !loginBtn;
   }
 
-  function scanFeed() {
-    if (!location.pathname.startsWith('/foryou')) return;
-    const links = document.querySelectorAll('a[href*="/video/"]');
-    for (const a of links) {
-      const m = (a.getAttribute('href') || '').match(/\/@([^/]+)\/video\/(\d+)/);
-      if (m && window.chrome && window.chrome.webview) {
-        const card = a.closest('[data-e2e="recommend-list-item-container"]') || a.parentElement;
-        const desc = card ? (card.querySelector('[data-e2e="video-desc"]')?.textContent || '') : '';
-        window.chrome.webview.postMessage(JSON.stringify({
-          kind: 'feed_item',
-          id: m[2],
-          author: m[1],
-          title: desc.slice(0, 80)
-        }));
+  function classifyCard(card) {
+    if (card.querySelector('[data-e2e="ad-badge"], [data-e2e="sponsored-tag"], a[href*="/ad/"]')) {
+      return 'ad';
+    }
+    if (card.querySelector('[data-e2e="live-badge"], [data-e2e="live-room"], a[href*="/live"]')) {
+      return 'live';
+    }
+    return 'video';
+  }
+
+  function extractFromCard(card) {
+    const link = card.querySelector('a[href*="/video/"], a[href*="/photo/"]');
+    if (link) {
+      const m = (link.getAttribute('href') || '').match(/\/@([^/]+)\/(?:video|photo)\/(\d+)/);
+      if (m) {
+        return { id: m[2], author: m[1], srcKind: 'href' };
       }
+    }
+    const xg = card.id && card.id.startsWith('xgwrapper-') ? card : card.querySelector('[id^="xgwrapper-"]');
+    if (xg) {
+      const m = xg.id.match(/^xgwrapper-\d+-(\d{10,})$/);
+      if (m) {
+        const authorEl = card.querySelector('[data-e2e="video-author-uniqueid"], a[href^="/@"]');
+        let author = authorEl ? (authorEl.textContent || '').replace(/^@/, '').trim() : '';
+        if (!author && authorEl && authorEl.getAttribute('href')) {
+          const am = authorEl.getAttribute('href').match(/^\/@([^/?]+)/);
+          if (am) author = am[1];
+        }
+        return { id: m[1], author: author || 'unknown', srcKind: 'xgwrapper' };
+      }
+    }
+    return null;
+  }
+
+  function scanFeed() {
+    lastScanMs = Date.now();
+    if (!location.pathname.startsWith('/foryou')) return;
+
+    const links = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]');
+    const cards = Array.from(document.querySelectorAll('article, [data-e2e="recommend-list-item-container"]'));
+
+    let processed = 0;
+    let ads = 0;
+    let live = 0;
+    let unidentified = 0;
+
+    if (cards.length > 0) {
+      cards.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+      cards.forEach((card, idx) => {
+        processed++;
+        const rawPos = card.getAttribute('data-scroll-index');
+        const pos = rawPos !== null && /^\d+$/.test(rawPos) ? Number(rawPos) : idx;
+        const itemType = classifyCard(card);
+        if (itemType === 'ad') ads++;
+        if (itemType === 'live') live++;
+
+        const info = extractFromCard(card);
+        if (info) {
+          const desc = card.querySelector('[data-e2e="video-desc"]')?.textContent || '';
+          post({
+            kind: 'feed_item',
+            id: info.id,
+            author: info.author,
+            title: desc.slice(0, 80),
+            itemType,
+            srcKind: info.srcKind,
+            pos
+          });
+        } else {
+          unidentified++;
+          const key = `card:${pos}:${itemType}:${card.tagName}:${card.getAttribute('data-e2e') || ''}`;
+          if (!loggedDiagKeys.has(key) && loggedDiagKeys.size < 40) {
+            loggedDiagKeys.add(key);
+            const hasVideo = !!card.querySelector('video');
+            const xgId = card.querySelector('[id^="xgwrapper-"]')?.id || '';
+            post({
+              kind: 'diag',
+              msg: `Unidentified pos=${pos} type=${itemType} tag=${card.tagName} e2e=${card.getAttribute('data-e2e') || '-'} video=${hasVideo} xg=${xgId}`
+            });
+          }
+        }
+      });
+    } else {
+      links.forEach((a, idx) => {
+        processed++;
+        const m = (a.getAttribute('href') || '').match(/\/@([^/]+)\/(?:video|photo)\/(\d+)/);
+        if (m) {
+          post({
+            kind: 'feed_item',
+            id: m[2],
+            author: m[1],
+            title: '',
+            itemType: 'video',
+            srcKind: 'href-fallback',
+            pos: idx
+          });
+        } else {
+          unidentified++;
+        }
+      });
+    }
+
+    post({
+      kind: 'scan_stats',
+      mutations,
+      links: links.length,
+      cards: cards.length,
+      processed,
+      ads,
+      live,
+      unidentified
+    });
+  }
+
+  function scheduleScan() {
+    const elapsed = Date.now() - lastScanMs;
+    if (elapsed >= 250) {
+      if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
+      scanFeed();
+    } else if (!scanTimer) {
+      scanTimer = setTimeout(() => {
+        scanTimer = null;
+        scanFeed();
+      }, 250 - elapsed);
     }
   }
 
-  setInterval(() => {
-    if (window.chrome && window.chrome.webview) {
-      window.chrome.webview.postMessage(JSON.stringify({
-        kind: 'heartbeat',
-        vis: document.visibilityState || 'unknown',
-        loggedIn: detectLoggedIn()
-      }));
-    }
+  const mo = new MutationObserver((list) => {
+    mutations += list.length;
+    scheduleScan();
+  });
+  mo.observe(document.documentElement, { childList: true, subtree: true });
+  window.addEventListener('scroll', scheduleScan, { passive: true, capture: true });
+
+  window.__bgTokDiagDump = () => {
+    const articles = document.querySelectorAll('article').length;
+    const rec = document.querySelectorAll('[data-e2e="recommend-list-item-container"]').length;
+    const vids = document.querySelectorAll('video').length;
+    const xgs = document.querySelectorAll('[id^="xgwrapper-"]').length;
+    const links = document.querySelectorAll('a[href*="/video/"]').length;
+    const idxs = Array.from(document.querySelectorAll('[data-scroll-index]')).map(e => e.getAttribute('data-scroll-index')).join(',');
+    post({
+      kind: 'diag',
+      msg: `DOM path=${location.pathname} articles=${articles} rec=${rec} videos=${vids} xg=${xgs} links=${links} scrollIdx=[${idxs}]`
+    });
     scanFeed();
+  };
+
+  setInterval(() => {
+    post({
+      kind: 'heartbeat',
+      vis: document.visibilityState || 'unknown',
+      loggedIn: detectLoggedIn()
+    });
+    scheduleScan();
   }, 1000);
 })();
 )JS";
@@ -413,8 +605,8 @@ void LayoutControls(HWND hwnd) {
     int left_w = 460;
     if (w < 800) left_w = w / 2;
 
-    if (g_state.status_hwnd) MoveWindow(g_state.status_hwnd, 10, 85, left_w - 20, 125, TRUE);
-    if (g_state.list_hwnd) MoveWindow(g_state.list_hwnd, 10, 215, left_w - 20, std::max(100, h - 225), TRUE);
+    if (g_state.status_hwnd) MoveWindow(g_state.status_hwnd, 10, 85, left_w - 20, 145, TRUE);
+    if (g_state.list_hwnd) MoveWindow(g_state.list_hwnd, 10, 235, left_w - 20, std::max(100, h - 245), TRUE);
     if (g_state.wv_host_hwnd) MoveWindow(g_state.wv_host_hwnd, left_w, 0, std::max(100, w - left_w), h, TRUE);
     ResizeWebView();
 }
@@ -430,9 +622,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             CreateWindowW(L"BUTTON", L"Reload", WS_CHILD | WS_VISIBLE, 10, 46, 105, 30, hwnd, btn_id(IDC_BTN_RELOAD), nullptr, nullptr);
             CreateWindowW(L"BUTTON", L"Reset Feed Log", WS_CHILD | WS_VISIBLE, 120, 46, 120, 30, hwnd, btn_id(IDC_BTN_CLEAR), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Diag DOM", WS_CHILD | WS_VISIBLE, 245, 46, 105, 30, hwnd, btn_id(IDC_BTN_DIAG), nullptr, nullptr);
 
-            g_state.status_hwnd = CreateWindowW(L"STATIC", L"Initializing WebView2...", WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 85, 440, 125, hwnd, btn_id(IDC_STATUS_TEXT), nullptr, nullptr);
-            g_state.list_hwnd = CreateWindowW(L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOINTEGRALHEIGHT, 10, 215, 440, 400, hwnd, btn_id(IDC_LOG_LIST), nullptr, nullptr);
+            g_state.status_hwnd = CreateWindowW(L"STATIC", L"Initializing WebView2...", WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 85, 440, 145, hwnd, btn_id(IDC_STATUS_TEXT), nullptr, nullptr);
+            g_state.list_hwnd = CreateWindowW(L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOINTEGRALHEIGHT, 10, 235, 440, 400, hwnd, btn_id(IDC_LOG_LIST), nullptr, nullptr);
             g_state.wv_host_hwnd = CreateWindowW(L"STATIC", nullptr, WS_CHILD | WS_VISIBLE, 460, 0, 600, 700, hwnd, nullptr, nullptr, nullptr);
 
             SetTimer(hwnd, TIMER_METRICS, 1000, nullptr);
@@ -475,6 +668,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_state.ordered_video_ids.clear();
                     SendMessageW(g_state.list_hwnd, LB_RESETCONTENT, 0, 0);
                     AddLog(L"[LOG] Cleared observed IDs");
+                    break;
+                case IDC_BTN_DIAG:
+                    if (g_state.webview) {
+                        g_state.webview->ExecuteScript(
+                            L"window.__bgTokDiagDump && window.__bgTokDiagDump()", nullptr);
+                    }
                     break;
             }
             return 0;
