@@ -99,6 +99,26 @@ async fn read_range(
     output: &mut [u8],
     cancel: CancellationToken,
 ) -> Result<(), ProviderError> {
+    // The C ABI does not limit the size of a read. Bound each provider
+    // operation while preserving one deadline and cancellation for the call.
+    for (index, chunk) in output.chunks_mut(MAX_READ).enumerate() {
+        read_chunk(
+            bridge,
+            offset + (index * MAX_READ) as u64,
+            chunk,
+            cancel.clone(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn read_chunk(
+    bridge: &Bridge,
+    offset: u64,
+    output: &mut [u8],
+    cancel: CancellationToken,
+) -> Result<(), ProviderError> {
     let range = ByteRange {
         start: offset,
         end: Some(offset + output.len() as u64 - 1),
@@ -149,12 +169,7 @@ unsafe extern "C" fn read_at(
     cancelled: Cancel,
     cancel_context: *mut c_void,
 ) -> c_int {
-    if context.is_null()
-        || output.is_null()
-        || count == 0
-        || count > MAX_READ
-        || Handle::try_current().is_ok()
-    {
+    if context.is_null() || output.is_null() || count == 0 || Handle::try_current().is_ok() {
         return IO;
     }
     if timeout_ms == 0 {
@@ -209,10 +224,52 @@ unsafe extern "C" fn release(context: *mut c_void) {
 mod tests {
     use super::*;
     use bg_tok_mock::{id, MockProvider};
+    use bytes::Bytes;
     use std::{
         ptr,
         time::{Instant, SystemTime},
     };
+
+    #[test]
+    fn large_abi_read_is_split_into_bounded_provider_reads() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let bytes: Vec<u8> = (0..MAX_READ + 97).map(|i| (i % 251) as u8).collect();
+        let provider = Arc::new(MockProvider::with_media(Bytes::copy_from_slice(&bytes)));
+        let item = id("one");
+        let source = runtime
+            .block_on(provider.sources(&item, CancellationToken::new()))
+            .unwrap()
+            .remove(0);
+        let range = RangeSource::new(
+            runtime.handle().clone(),
+            provider,
+            CancellationToken::new(),
+            item,
+            source,
+            bytes.len() as u64,
+        )
+        .unwrap();
+        let mut actual = vec![0; bytes.len()];
+        let raw = &range.0;
+        assert_eq!(
+            unsafe {
+                (raw.read_at)(
+                    raw.context,
+                    0,
+                    actual.as_mut_ptr(),
+                    actual.len(),
+                    5000,
+                    None,
+                    ptr::null_mut(),
+                )
+            },
+            OK
+        );
+        assert_eq!(actual, bytes);
+    }
 
     #[test]
     fn reads_exact_ranges_refreshes_and_respects_timeout_and_logout() {

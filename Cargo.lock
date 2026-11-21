@@ -64,6 +64,7 @@ version = "0.1.0"
 dependencies = [
  "bg-tok",
  "bg-tok-mock",
+ "bytes",
  "futures-util",
  "tokio",
  "tokio-util",
