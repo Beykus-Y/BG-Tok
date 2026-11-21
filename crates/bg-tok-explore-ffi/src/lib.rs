@@ -387,11 +387,13 @@ mod tests {
             session: CancellationToken::new(),
             state: Arc::new(Mutex::new(State::Loading)),
         }));
+        let started = std::time::Instant::now();
         unsafe {
             bg_tok_explore_cancel(host);
             assert_eq!(bg_tok_explore_status(host), 3);
             assert_eq!(bg_tok_explore_count(host), 0);
             bg_tok_explore_destroy(host);
         }
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
