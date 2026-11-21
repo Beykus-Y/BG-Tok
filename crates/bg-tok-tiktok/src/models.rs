@@ -55,7 +55,8 @@ impl TikTokSourceCandidate {
             height: self.height,
             bitrate_bps: self.bitrate_bps,
             expires_at: self.expires_at,
-            cache: CachePolicy::HostManaged,
+            // Persistent storage requires a separately established policy.
+            cache: CachePolicy::NoStore,
         }
     }
 }

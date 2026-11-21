@@ -192,6 +192,10 @@ fn parses_video_html_and_errors() {
         "6718335390845095173:normal_540_0"
     );
     assert_eq!(video.sources[0].length, Some(10));
+    assert_eq!(
+        video.sources[0].to_source().cache,
+        bg_tok::provider::CachePolicy::NoStore
+    );
 
     let not_found_html = sample_video_html("1", 1_900_000_000, 10204);
     assert_eq!(
@@ -272,9 +276,11 @@ async fn refreshes_expired_source_through_media_delivery() {
                 });
             }
             assert!(range.is_some());
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_RANGE, "bytes 0-9/10".parse().unwrap());
             Ok(StubResponse {
                 status: 206,
-                headers: HeaderMap::new(),
+                headers,
                 body: Ok(b"0123456789".to_vec()),
             })
         },
@@ -502,4 +508,49 @@ fn builds_login_kit_and_parses_oauth_and_qr_responses() {
         }
         other => panic!("unexpected qr status: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn rejects_cdn_length_mismatch() {
+    let transport = Arc::new(MockTransport::new(Box::new(|_, url, _, range| {
+        if url.path().starts_with("/@_/video/") {
+            return Ok(StubResponse {
+                status: 200,
+                headers: HeaderMap::new(),
+                body: Ok(sample_video_html("6718335390845095173", 4_000_000_000, 0).into_bytes()),
+            });
+        }
+        assert!(range.is_some());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_RANGE, "bytes 0-9/11".parse().unwrap());
+        Ok(StubResponse {
+            status: 206,
+            headers,
+            body: Ok(b"0123456789".to_vec()),
+        })
+    })));
+    let provider = TikTokProvider::with_transport(
+        transport,
+        TikTokConfig {
+            min_request_interval: Duration::ZERO,
+            ..TikTokConfig::default()
+        },
+    );
+    let id = ContentId {
+        namespace: TIKTOK_NAMESPACE.into(),
+        value: "6718335390845095173".into(),
+    };
+    let source = provider
+        .sources(&id, CancellationToken::new())
+        .await
+        .unwrap()
+        .remove(0);
+    let response = provider
+        .read(
+            &source,
+            Some(ByteRange::new(0, Some(9)).unwrap()),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(response, Err(ProviderError::InvalidResponse)));
 }

@@ -510,6 +510,24 @@ impl<T: Transport> ContentProvider for TikTokProvider<T> {
                 .await
             {
                 Ok(resp) => {
+                    // The metadata length is only a claim until the CDN's
+                    // Content-Range total agrees. Check on every range so a
+                    // refreshed URL cannot silently change representation.
+                    if range.is_some() {
+                        let total = resp
+                            .headers
+                            .get(header::CONTENT_RANGE)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| value.strip_prefix("bytes "))
+                            .and_then(|value| value.rsplit_once('/'))
+                            .and_then(|(_, total)| total.parse::<u64>().ok());
+                        if resp.status != 206
+                            || total.is_none()
+                            || source.length.is_some_and(|length| Some(length) != total)
+                        {
+                            return Err(ProviderError::InvalidResponse);
+                        }
+                    }
                     let mapped = resp.body.map(|item| item.map_err(map_network_error));
                     return Ok(Box::pin(mapped));
                 }
