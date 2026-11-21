@@ -86,6 +86,31 @@ fn real_mp4_ranges_travel_through_delivery_and_ffi() {
         assert_eq!(&actual[..], &file[offset..offset + 32]);
     }
     assert_eq!(provider.read_calls(), 3);
+    let context = handle.context as usize;
+    let read_at = handle.read_at;
+    std::thread::scope(|threads| {
+        for index in 0..12 {
+            let expected = &file;
+            threads.spawn(move || {
+                let offset = index * 37;
+                let mut actual = [0; 32];
+                let status = unsafe {
+                    read_at(
+                        context as *mut _,
+                        offset as u64,
+                        actual.as_mut_ptr(),
+                        actual.len(),
+                        1000,
+                        None,
+                        ptr::null_mut(),
+                    )
+                };
+                assert_eq!(status, 0);
+                assert_eq!(&actual[..], &expected[offset..offset + 32]);
+            });
+        }
+    });
+    assert_eq!(provider.read_calls(), 15);
     session.cancel();
     let mut byte = [0];
     assert_eq!(

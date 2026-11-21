@@ -189,6 +189,7 @@ impl ContentProvider for FileProvider {
         if end < range.start || end >= item.length || end - range.start >= MAX_READ as u64 {
             return Err(ProviderError::InvalidResponse);
         }
+        self.calls.fetch_add(1, Ordering::Relaxed);
         let permit = tokio::select! { biased; _ = cancel.cancelled() => return Err(ProviderError::Cancelled), p = self.slots.clone().acquire_owned() => p.map_err(|_| ProviderError::SessionClosed)? };
         if self.bytes_per_second != 0 {
             let seconds = (end - range.start + 1) as f64 / self.bytes_per_second as f64;
@@ -196,7 +197,6 @@ impl ContentProvider for FileProvider {
         }
         let items = self.items.clone();
         let token = cancel.clone();
-        let calls = self.calls.clone();
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             if token.is_cancelled() {
@@ -204,7 +204,6 @@ impl ContentProvider for FileProvider {
             }
             let item = &items[i];
             check_file(item)?;
-            calls.fetch_add(1, Ordering::Relaxed);
             let mut data = vec![0; (end - range.start + 1) as usize];
             let mut read = 0;
             while read < data.len() {
