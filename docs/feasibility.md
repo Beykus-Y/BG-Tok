@@ -60,3 +60,21 @@ explicit TikTok partnership or future official product may change the decision.
    signed URLs or private responses in fixtures.
 4. Record limitations and results here without secrets. If any part fails or is
    unavailable, keep the gate closed and report the supported alternative.
+
+## Open implementation review (2026-11-20)
+
+This review inspected project metadata and READMEs, not live TikTok responses:
+
+* [TikTok-Api](https://github.com/davidteather/TikTok-Api) (MIT) describes an
+  unofficial Python/Playwright data retrieval wrapper. Its README explicitly
+  says it has no user-authenticated routes and cannot post on behalf of a user.
+  It cannot demonstrate the required personalized account feed or view events.
+* [TikTokLive](https://github.com/isaackogan/TikTokLive) (AGPL-3.0) describes
+  unofficial livestream event reception and calls itself a reverse engineering
+  project, not production-ready. LIVE event reception is a different use case;
+  it does not demonstrate the required personalized feed or native playback.
+  Its license and any service terms require independent review before reuse.
+
+These statements establish what the projects describe, not that their methods
+currently work or are authorized. Neither implementation was incorporated or
+run against the service; no protection bypass is proposed.

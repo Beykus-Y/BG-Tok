@@ -1,5 +1,8 @@
-//! BG Tok library foundation.
-//!
-//! The personalized TikTok feed is gated on a demonstration of authorized
-//! access. See `docs/feasibility.md` for the evidence and outstanding work.
+//! Provider-independent primitives for BG Tok. No TikTok provider is included.
 #![forbid(unsafe_code)]
+
+pub mod account;
+pub mod feed;
+pub mod media;
+pub mod network;
+pub mod provider;

@@ -4,5 +4,16 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-[lib]
-path = "src/lib.rs"
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+futures-util = "0.3"
+httpdate = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "socks"] }
+thiserror = "2"
+zeroize = "1"
+tokio = { version = "1", features = ["macros", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
