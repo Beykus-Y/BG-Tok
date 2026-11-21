@@ -12,6 +12,8 @@
 #define _UNICODE
 #endif
 
+#include "feed_queue.h"
+
 #include <windows.h>
 #include <commctrl.h>
 #include <psapi.h>
@@ -48,6 +50,10 @@ constexpr int IDC_BTN_MINIMIZE = 104;
 constexpr int IDC_BTN_RELOAD = 105;
 constexpr int IDC_BTN_CLEAR = 106;
 constexpr int IDC_BTN_DIAG = 109;
+constexpr int IDC_BTN_PREV = 110;
+constexpr int IDC_BTN_NEXT = 111;
+constexpr int IDC_CHK_SYNC = 112;
+constexpr int IDC_BTN_PAUSE_MEDIA = 113;
 constexpr int IDC_STATUS_TEXT = 107;
 constexpr int IDC_LOG_LIST = 108;
 constexpr UINT_PTR TIMER_METRICS = 1;
@@ -58,6 +64,7 @@ struct AppState {
     HWND status_hwnd = nullptr;
     HWND list_hwnd = nullptr;
     HWND wv_host_hwnd = nullptr;
+    HWND chk_sync_hwnd = nullptr;
 
     ComPtr<ICoreWebView2Environment> env;
     ComPtr<ICoreWebView2Controller> controller;
@@ -70,17 +77,20 @@ struct AppState {
     std::wstring js_visibility = L"unknown";
 
     bool wv_visible = true;
+    bool media_paused = false;
+    bool sync_wv2_on_nav = false;
     uint64_t heartbeat_count = 0;
     uint64_t hidden_heartbeats = 0;
     uint64_t dom_mutations = 0;
     uint64_t links_found = 0;
-    uint64_t cards_found = 0;
-    uint64_t cards_processed = 0;
-    uint64_t ads_count = 0;
-    uint64_t live_count = 0;
-    uint64_t unidentified_count = 0;
-    std::set<std::wstring> seen_video_ids;
-    std::vector<std::wstring> ordered_video_ids;
+    uint64_t current_dom_cards = 0;
+    uint64_t accumulated_cards = 0;
+    uint64_t expected_aborts = 0;
+    uint64_t nav_errors = 0;
+    uint64_t dom_errors = 0;
+    uint64_t wv2_errors = 0;
+
+    bgtok::FeedQueue queue{3};
 
     // CPU calculation state
     ULONGLONG prev_sys_time = 0;
@@ -177,16 +187,23 @@ void UpdateMetrics() {
     }
 
     SIZE_T host_ws = 0;
+    SIZE_T host_priv = 0;
     SIZE_T wv_ws = 0;
+    SIZE_T wv_priv = 0;
     ULONGLONG total_proc_time = 0;
 
     for (DWORD pid : all_pids) {
         HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
         if (!h) continue;
-        PROCESS_MEMORY_COUNTERS pmc{};
-        if (GetProcessMemoryInfo(h, &pmc, sizeof(pmc))) {
-            if (pid == self_pid) host_ws += pmc.WorkingSetSize;
-            else wv_ws += pmc.WorkingSetSize;
+        PROCESS_MEMORY_COUNTERS_EX pmc{};
+        if (GetProcessMemoryInfo(h, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
+            if (pid == self_pid) {
+                host_ws += pmc.WorkingSetSize;
+                host_priv += pmc.PrivateUsage;
+            } else {
+                wv_ws += pmc.WorkingSetSize;
+                wv_priv += pmc.PrivateUsage;
+            }
         }
         FILETIME ct{}, et{}, kt{}, ut{};
         if (GetProcessTimes(h, &ct, &et, &kt, &ut)) {
@@ -209,30 +226,39 @@ void UpdateMetrics() {
 
     double profile_mb = DirSizeMb(g_state.profile_dir);
     BOOL minimized = IsIconic(g_state.main_hwnd);
+    const bgtok::FeedItem* cur = g_state.queue.Current();
+    std::wstring cur_id = cur ? cur->video_id : L"-";
+    std::wstring cur_idx = g_state.queue.CurrentIndex().has_value()
+        ? std::to_wstring(*g_state.queue.CurrentIndex() + 1)
+        : L"0";
 
     std::wostringstream ss;
     ss.precision(1);
     ss << std::fixed;
-    ss << L"Runtime: " << g_state.runtime_version
-       << L" | Mode: " << (minimized ? L"MINIMIZED" : (g_state.wv_visible ? L"VISIBLE" : L"HIDDEN"))
-       << L"\r\nURL: " << g_state.current_url
-       << L"\r\nAuth (DOM): " << g_state.auth_state
+    ss << L"WV2: " << (minimized ? L"MINIMIZED" : (g_state.wv_visible ? L"VISIBLE" : L"HIDDEN"))
+       << L" | Media: " << (g_state.media_paused ? L"PAUSED" : L"ACTIVE")
+       << L" | Auth: " << g_state.auth_state
        << L" | JS vis: " << g_state.js_visibility
-       << L"\r\nHeartbeats: " << g_state.heartbeat_count
-       << L" (hidden: " << g_state.hidden_heartbeats << L")"
-       << L" | Mutations: " << g_state.dom_mutations
-       << L"\r\nLinks: " << g_state.links_found
-       << L" | Cards: " << g_state.cards_found
-       << L" (proc: " << g_state.cards_processed << L")"
-       << L" | Unique IDs: " << g_state.ordered_video_ids.size()
-       << L"\r\nAds: " << g_state.ads_count
-       << L" | LIVE: " << g_state.live_count
-       << L" | Unidentified: " << g_state.unidentified_count
-       << L"\r\nHost RAM: " << (static_cast<double>(host_ws) / (1024.0 * 1024.0)) << L" MB"
-       << L" | WV2 (" << (all_pids.size() > 0 ? all_pids.size() - 1 : 0) << L" procs): "
-       << (static_cast<double>(wv_ws) / (1024.0 * 1024.0)) << L" MB"
-       << L" | CPU: " << g_state.last_cpu_pct << L"%"
-       << L" | Profile: " << profile_mb << L" MB";
+       << L"\r\nFeed: " << bgtok::FeedStateToString(g_state.queue.State())
+       << L" | Cur: " << cur_id << L" (" << cur_idx << L"/" << g_state.queue.Length()
+       << L", rem: " << g_state.queue.Remaining() << L")"
+       << L"\r\nLast ID: " << (g_state.queue.LastVideoId().empty() ? L"-" : g_state.queue.LastVideoId())
+       << L" | Dup: " << g_state.queue.DuplicatesCount()
+       << L" | Skip(ad/live): " << g_state.queue.SkippedCount()
+       << L" | Gaps: " << g_state.queue.GapsCount()
+       << L"\r\nDOM Cards: " << g_state.current_dom_cards
+       << L" (acc: " << g_state.accumulated_cards << L")"
+       << L" | Links: " << g_state.links_found
+       << L" | Mut: " << g_state.dom_mutations
+       << L"\r\nHB: " << g_state.heartbeat_count << L" (hid: " << g_state.hidden_heartbeats << L")"
+       << L" | Aborts: " << g_state.expected_aborts
+       << L" | Err(nav/dom/wv2): " << g_state.nav_errors << L"/" << g_state.dom_errors << L"/" << g_state.wv2_errors
+       << L"\r\nHost WS/Priv: " << (static_cast<double>(host_ws) / (1024.0 * 1024.0))
+       << L"/" << (static_cast<double>(host_priv) / (1024.0 * 1024.0)) << L" MB"
+       << L" | WV2(" << (all_pids.size() > 0 ? all_pids.size() - 1 : 0) << L"): "
+       << (static_cast<double>(wv_ws) / (1024.0 * 1024.0))
+       << L"/" << (static_cast<double>(wv_priv) / (1024.0 * 1024.0)) << L" MB"
+       << L"\r\nCPU: " << g_state.last_cpu_pct << L"% | Profile: " << profile_mb << L" MB";
 
     SetWindowTextW(g_state.status_hwnd, ss.str().c_str());
 }
@@ -306,27 +332,33 @@ void HandlePageMessage(const std::wstring& source, const std::wstring& raw_json)
     } else if (kind == L"scan_stats") {
         g_state.dom_mutations = ExtractJsonUint(raw_json, L"mutations");
         g_state.links_found = ExtractJsonUint(raw_json, L"links");
-        g_state.cards_found = ExtractJsonUint(raw_json, L"cards");
-        g_state.cards_processed = ExtractJsonUint(raw_json, L"processed");
-        g_state.ads_count = ExtractJsonUint(raw_json, L"ads");
-        g_state.live_count = ExtractJsonUint(raw_json, L"live");
-        g_state.unidentified_count = ExtractJsonUint(raw_json, L"unidentified");
+        g_state.current_dom_cards = ExtractJsonUint(raw_json, L"cards");
+        g_state.accumulated_cards += ExtractJsonUint(raw_json, L"processed");
     } else if (kind == L"feed_item") {
-        std::wstring vid = ExtractJsonString(raw_json, L"id");
-        std::wstring author = ExtractJsonString(raw_json, L"author");
-        std::wstring title = ExtractJsonString(raw_json, L"title");
-        std::wstring item_type = ExtractJsonString(raw_json, L"itemType");
-        std::wstring src_kind = ExtractJsonString(raw_json, L"srcKind");
-        uint64_t dom_pos = ExtractJsonUint(raw_json, L"pos");
-        if (!vid.empty() && std::all_of(vid.begin(), vid.end(), iswdigit)) {
-            if (g_state.seen_video_ids.insert(vid).second) {
-                g_state.ordered_video_ids.push_back(vid);
-                std::wstring line = L"#" + std::to_wstring(g_state.ordered_video_ids.size()) +
-                                    L" (dom@" + std::to_wstring(dom_pos) + L"," + item_type + L"," + src_kind +
-                                    L") [" + vid + L"] @" + author + L" - " + title.substr(0, 48);
+        bgtok::FeedItem item{};
+        item.video_id = ExtractJsonString(raw_json, L"id");
+        item.author = ExtractJsonString(raw_json, L"author");
+        item.title = ExtractJsonString(raw_json, L"title");
+        item.item_type = ExtractJsonString(raw_json, L"itemType");
+        item.src_kind = ExtractJsonString(raw_json, L"srcKind");
+        item.dom_pos = ExtractJsonUint(raw_json, L"pos");
+        item.observed_at_ms = GetTickCount64();
+
+        if (!item.video_id.empty() && std::all_of(item.video_id.begin(), item.video_id.end(), iswdigit)) {
+            auto r = g_state.queue.Push(item, g_state.queue.generation());
+            if (r.accepted) {
+                std::wstring line = L"#" + std::to_wstring(g_state.queue.Length()) +
+                                    L" (dom@" + std::to_wstring(item.dom_pos) + L"," + item.src_kind +
+                                    L") [" + item.video_id + L"] @" + item.author + L" - " + item.title.substr(0, 44);
                 AddLog(line);
             }
         }
+    } else if (kind == L"abort") {
+        g_state.expected_aborts++;
+    } else if (kind == L"dom_err") {
+        g_state.dom_errors++;
+        std::wstring msg = ExtractJsonString(raw_json, L"msg");
+        if (!msg.empty()) AddLog(L"[DOM-ERR] " + msg);
     } else if (kind == L"diag") {
         std::wstring msg = ExtractJsonString(raw_json, L"msg");
         if (!msg.empty()) {
@@ -338,181 +370,271 @@ void HandlePageMessage(const std::wstring& source, const std::wstring& raw_json)
 const wchar_t* kObserverScript = LR"JS(
 (() => {
   if (window.__bgTokObserverInstalled) return;
-  window.__bgTokObserverInstalled = true;
-
-  let mutations = 0;
-  let scanTimer = null;
-  let lastScanMs = 0;
-  const loggedDiagKeys = new Set();
 
   function post(obj) {
-    if (window.chrome && window.chrome.webview) {
-      window.chrome.webview.postMessage(JSON.stringify(obj));
-    }
-  }
-
-  function detectLoggedIn() {
-    const loginBtn = document.querySelector('[data-e2e="top-login-button"]');
-    const profile = document.querySelector('[data-e2e="profile-icon"], [data-e2e="nav-profile"]');
-    return !!profile && !loginBtn;
-  }
-
-  function classifyCard(card) {
-    if (card.querySelector('[data-e2e="ad-badge"], [data-e2e="sponsored-tag"], a[href*="/ad/"]')) {
-      return 'ad';
-    }
-    if (card.querySelector('[data-e2e="live-badge"], [data-e2e="live-room"], a[href*="/live"]')) {
-      return 'live';
-    }
-    return 'video';
-  }
-
-  function extractFromCard(card) {
-    const link = card.querySelector('a[href*="/video/"], a[href*="/photo/"]');
-    if (link) {
-      const m = (link.getAttribute('href') || '').match(/\/@([^/]+)\/(?:video|photo)\/(\d+)/);
-      if (m) {
-        return { id: m[2], author: m[1], srcKind: 'href' };
+    try {
+      if (window.chrome && window.chrome.webview) {
+        window.chrome.webview.postMessage(JSON.stringify(obj));
       }
-    }
-    const xg = card.id && card.id.startsWith('xgwrapper-') ? card : card.querySelector('[id^="xgwrapper-"]');
-    if (xg) {
-      const m = xg.id.match(/^xgwrapper-\d+-(\d{10,})$/);
-      if (m) {
-        const authorEl = card.querySelector('[data-e2e="video-author-uniqueid"], a[href^="/@"]');
-        let author = authorEl ? (authorEl.textContent || '').replace(/^@/, '').trim() : '';
-        if (!author && authorEl && authorEl.getAttribute('href')) {
-          const am = authorEl.getAttribute('href').match(/^\/@([^/?]+)/);
-          if (am) author = am[1];
-        }
-        return { id: m[1], author: author || 'unknown', srcKind: 'xgwrapper' };
-      }
-    }
-    return null;
+    } catch (_) {}
   }
 
-  function scanFeed() {
-    lastScanMs = Date.now();
-    if (!location.pathname.startsWith('/foryou')) return;
+  try {
+    let mutations = 0;
+    let scanTimer = null;
+    let lastScanMs = 0;
+    let observerStarted = false;
+    const loggedDiagKeys = new Set();
 
-    const links = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]');
-    const cards = Array.from(document.querySelectorAll('article, [data-e2e="recommend-list-item-container"]'));
+    let mediaPaused = false;
 
-    let processed = 0;
-    let ads = 0;
-    let live = 0;
-    let unidentified = 0;
+    function isAbortLike(err) {
+      const s = String(err && err.name ? err.name : '') + ' ' + String(err && err.message ? err.message : err);
+      return /AbortError|aborted|interrupted by a call to pause|The play\(\) request was interrupted/i.test(s);
+    }
 
-    if (cards.length > 0) {
-      cards.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-      cards.forEach((card, idx) => {
-        processed++;
-        const rawPos = card.getAttribute('data-scroll-index');
-        const pos = rawPos !== null && /^\d+$/.test(rawPos) ? Number(rawPos) : idx;
-        const itemType = classifyCard(card);
-        if (itemType === 'ad') ads++;
-        if (itemType === 'live') live++;
+    window.addEventListener('error', (e) => {
+      if (isAbortLike(e && (e.error || e.message))) { post({ kind: 'abort' }); return; }
+      post({ kind: 'dom_err', msg: 'JS error: ' + String(e && e.message ? e.message : e) });
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      if (isAbortLike(e && e.reason)) { post({ kind: 'abort' }); return; }
+      post({ kind: 'dom_err', msg: 'JS rejection: ' + String(e && e.reason ? e.reason : e) });
+    });
 
-        const info = extractFromCard(card);
-        if (info) {
-          const desc = card.querySelector('[data-e2e="video-desc"]')?.textContent || '';
-          post({
-            kind: 'feed_item',
-            id: info.id,
-            author: info.author,
-            title: desc.slice(0, 80),
-            itemType,
-            srcKind: info.srcKind,
-            pos
-          });
-        } else {
-          unidentified++;
-          const key = `card:${pos}:${itemType}:${card.tagName}:${card.getAttribute('data-e2e') || ''}`;
-          if (!loggedDiagKeys.has(key) && loggedDiagKeys.size < 40) {
-            loggedDiagKeys.add(key);
-            const hasVideo = !!card.querySelector('video');
-            const xgId = card.querySelector('[id^="xgwrapper-"]')?.id || '';
-            post({
-              kind: 'diag',
-              msg: `Unidentified pos=${pos} type=${itemType} tag=${card.tagName} e2e=${card.getAttribute('data-e2e') || '-'} video=${hasVideo} xg=${xgId}`
-            });
-          }
-        }
-      });
-    } else {
-      links.forEach((a, idx) => {
-        processed++;
-        const m = (a.getAttribute('href') || '').match(/\/@([^/]+)\/(?:video|photo)\/(\d+)/);
+    function detectLoggedIn() {
+      if (!document || !document.querySelector) return false;
+      const loginBtn = document.querySelector('[data-e2e="top-login-button"]');
+      const profile = document.querySelector('[data-e2e="profile-icon"], [data-e2e="nav-profile"]');
+      return !!profile && !loginBtn;
+    }
+
+    function classifyCard(card) {
+      if (card.querySelector('[data-e2e="ad-badge"], [data-e2e="sponsored-tag"], a[href*="/ad/"]')) {
+        return 'ad';
+      }
+      if (card.querySelector('[data-e2e="live-badge"], [data-e2e="live-room"], a[href*="/live"]')) {
+        return 'live';
+      }
+      return 'video';
+    }
+
+    function extractFromCard(card) {
+      const link = card.querySelector('a[href*="/video/"], a[href*="/photo/"]');
+      if (link) {
+        const m = (link.getAttribute('href') || '').match(/\/@([^/]+)\/(?:video|photo)\/(\d+)/);
         if (m) {
-          post({
-            kind: 'feed_item',
-            id: m[2],
-            author: m[1],
-            title: '',
-            itemType: 'video',
-            srcKind: 'href-fallback',
-            pos: idx
+          return { id: m[2], author: m[1], srcKind: 'href' };
+        }
+      }
+      const xg = card.id && card.id.startsWith('xgwrapper-') ? card : card.querySelector('[id^="xgwrapper-"]');
+      if (xg) {
+        const m = xg.id.match(/^xgwrapper-\d+-(\d{10,})$/);
+        if (m) {
+          const authorEl = card.querySelector('[data-e2e="video-author-uniqueid"], a[href^="/@"]');
+          let author = authorEl ? (authorEl.textContent || '').replace(/^@/, '').trim() : '';
+          if (!author && authorEl && authorEl.getAttribute('href')) {
+            const am = authorEl.getAttribute('href').match(/^\/@([^/?]+)/);
+            if (am) author = am[1];
+          }
+          return { id: m[1], author: author || 'unknown', srcKind: 'xgwrapper' };
+        }
+      }
+      return null;
+    }
+
+    function scanFeed() {
+      try {
+        lastScanMs = Date.now();
+        if (!location.pathname.startsWith('/foryou')) return;
+        if (!document || !document.querySelectorAll) return;
+
+        const links = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]');
+        const cards = Array.from(document.querySelectorAll('article, [data-e2e="recommend-list-item-container"]'));
+
+        let processed = 0;
+        let ads = 0;
+        let live = 0;
+        let unidentified = 0;
+
+        if (cards.length > 0) {
+          cards.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+          cards.forEach((card, idx) => {
+            processed++;
+            const rawPos = card.getAttribute('data-scroll-index');
+            const pos = rawPos !== null && /^\d+$/.test(rawPos) ? Number(rawPos) : idx;
+            const itemType = classifyCard(card);
+            if (itemType === 'ad') ads++;
+            if (itemType === 'live') live++;
+
+            const info = extractFromCard(card);
+            if (info) {
+              const desc = card.querySelector('[data-e2e="video-desc"]')?.textContent || '';
+              post({
+                kind: 'feed_item',
+                id: info.id,
+                author: info.author,
+                title: desc.slice(0, 80),
+                itemType,
+                srcKind: info.srcKind,
+                pos
+              });
+            } else {
+              unidentified++;
+              const key = `card:${pos}:${itemType}:${card.tagName}:${card.getAttribute('data-e2e') || ''}`;
+              if (!loggedDiagKeys.has(key) && loggedDiagKeys.size < 40) {
+                loggedDiagKeys.add(key);
+                const hasVideo = !!card.querySelector('video');
+                const xgId = card.querySelector('[id^="xgwrapper-"]')?.id || '';
+                post({
+                  kind: 'diag',
+                  msg: `Unidentified pos=${pos} type=${itemType} tag=${card.tagName} e2e=${card.getAttribute('data-e2e') || '-'} video=${hasVideo} xg=${xgId}`
+                });
+              }
+            }
           });
         } else {
-          unidentified++;
+          links.forEach((a, idx) => {
+            processed++;
+            const m = (a.getAttribute('href') || '').match(/\/@([^/]+)\/(?:video|photo)\/(\d+)/);
+            if (m) {
+              post({
+                kind: 'feed_item',
+                id: m[2],
+                author: m[1],
+                title: '',
+                itemType: 'video',
+                srcKind: 'href-fallback',
+                pos: idx
+              });
+            } else {
+              unidentified++;
+            }
+          });
         }
-      });
+
+        post({
+          kind: 'scan_stats',
+          mutations,
+          links: links.length,
+          cards: cards.length,
+          processed,
+          ads,
+          live,
+          unidentified
+        });
+      } catch (err) {
+        post({ kind: 'diag', msg: 'scanFeed error: ' + String(err && err.message ? err.message : err) });
+      }
     }
 
-    post({
-      kind: 'scan_stats',
-      mutations,
-      links: links.length,
-      cards: cards.length,
-      processed,
-      ads,
-      live,
-      unidentified
-    });
-  }
-
-  function scheduleScan() {
-    const elapsed = Date.now() - lastScanMs;
-    if (elapsed >= 250) {
-      if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
-      scanFeed();
-    } else if (!scanTimer) {
-      scanTimer = setTimeout(() => {
-        scanTimer = null;
+    function scheduleScan() {
+      const elapsed = Date.now() - lastScanMs;
+      if (elapsed >= 250) {
+        if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
         scanFeed();
-      }, 250 - elapsed);
+      } else if (!scanTimer) {
+        scanTimer = setTimeout(() => {
+          scanTimer = null;
+          scanFeed();
+        }, 250 - elapsed);
+      }
     }
+
+    // Register Diag DOM and heartbeat BEFORE DOM observer so they work regardless of DOM readiness.
+)JS" LR"JS(
+    window.__bgTokDiagDump = () => {
+      try {
+        const articles = document.querySelectorAll('article').length;
+        const rec = document.querySelectorAll('[data-e2e="recommend-list-item-container"]').length;
+        const vids = document.querySelectorAll('video').length;
+        const xgs = document.querySelectorAll('[id^="xgwrapper-"]').length;
+        const links = document.querySelectorAll('a[href*="/video/"]').length;
+        const idxs = Array.from(document.querySelectorAll('[data-scroll-index]')).map(e => e.getAttribute('data-scroll-index')).join(',');
+        post({
+          kind: 'diag',
+          msg: `DOM path=${location.pathname} obs=${observerStarted} articles=${articles} rec=${rec} videos=${vids} xg=${xgs} links=${links} scrollIdx=[${idxs}]`
+        });
+        scanFeed();
+        return 'ok';
+      } catch (err) {
+        post({ kind: 'diag', msg: 'DiagDump error: ' + String(err && err.message ? err.message : err) });
+        return 'error';
+      }
+    };
+
+    // Single-step user-initiated navigation for Sync WV2 test (never auto-scrolls).
+    window.__bgTokStepNav = (dir) => {
+      try {
+        const key = dir > 0 ? 'ArrowDown' : 'ArrowUp';
+        const code = dir > 0 ? 40 : 38;
+        const ev = new KeyboardEvent('keydown', { key, code: key, keyCode: code, which: code, bubbles: true, cancelable: true });
+        document.dispatchEvent(ev);
+        if (document.activeElement) document.activeElement.dispatchEvent(ev);
+        scheduleScan();
+        return 'ok';
+      } catch (err) {
+        post({ kind: 'dom_err', msg: 'StepNav error: ' + String(err && err.message ? err.message : err) });
+        return 'error';
+      }
+    };
+
+    window.__bgTokSetMediaPaused = (paused) => {
+      try {
+        mediaPaused = !!paused;
+        for (const v of document.querySelectorAll('video, audio')) {
+          if (mediaPaused) v.pause();
+        }
+        return 'ok';
+      } catch (err) {
+        post({ kind: 'dom_err', msg: 'MediaPause error: ' + String(err && err.message ? err.message : err) });
+        return 'error';
+      }
+    };
+
+    setInterval(() => {
+      if (mediaPaused) {
+        for (const v of document.querySelectorAll('video, audio')) {
+          if (!v.paused) v.pause();
+        }
+      }
+      post({
+        kind: 'heartbeat',
+        vis: document.visibilityState || 'unknown',
+        loggedIn: detectLoggedIn()
+      });
+      scheduleScan();
+    }, 1000);
+
+    function startObserver() {
+      if (observerStarted) return;
+      const target = document.documentElement || document.body;
+      if (!target) return;
+      try {
+        const mo = new MutationObserver((list) => {
+          mutations += list.length;
+          scheduleScan();
+        });
+        mo.observe(target, { childList: true, subtree: true });
+        window.addEventListener('scroll', scheduleScan, { passive: true, capture: true });
+        observerStarted = true;
+        scheduleScan();
+      } catch (err) {
+        post({ kind: 'diag', msg: 'Observer start error: ' + String(err && err.message ? err.message : err) });
+      }
+    }
+
+    if (document.documentElement) {
+      startObserver();
+    } else {
+      document.addEventListener('DOMContentLoaded', startObserver, { once: true });
+      document.addEventListener('readystatechange', startObserver);
+    }
+
+    window.__bgTokObserverInstalled = true;
+  } catch (err) {
+    post({ kind: 'diag', msg: 'Observer fatal init error: ' + String(err && err.message ? err.message : err) });
   }
-
-  const mo = new MutationObserver((list) => {
-    mutations += list.length;
-    scheduleScan();
-  });
-  mo.observe(document.documentElement, { childList: true, subtree: true });
-  window.addEventListener('scroll', scheduleScan, { passive: true, capture: true });
-
-  window.__bgTokDiagDump = () => {
-    const articles = document.querySelectorAll('article').length;
-    const rec = document.querySelectorAll('[data-e2e="recommend-list-item-container"]').length;
-    const vids = document.querySelectorAll('video').length;
-    const xgs = document.querySelectorAll('[id^="xgwrapper-"]').length;
-    const links = document.querySelectorAll('a[href*="/video/"]').length;
-    const idxs = Array.from(document.querySelectorAll('[data-scroll-index]')).map(e => e.getAttribute('data-scroll-index')).join(',');
-    post({
-      kind: 'diag',
-      msg: `DOM path=${location.pathname} articles=${articles} rec=${rec} videos=${vids} xg=${xgs} links=${links} scrollIdx=[${idxs}]`
-    });
-    scanFeed();
-  };
-
-  setInterval(() => {
-    post({
-      kind: 'heartbeat',
-      vis: document.visibilityState || 'unknown',
-      loggedIn: detectLoggedIn()
-    });
-    scheduleScan();
-  }, 1000);
 })();
 )JS";
 
@@ -554,9 +676,6 @@ void InitWebView2() {
                             ResizeWebView();
 
                             if (g_state.webview) {
-                                g_state.webview->AddScriptToExecuteOnDocumentCreated(
-                                    kObserverScript, nullptr);
-
                                 EventRegistrationToken tok{};
                                 g_state.webview->add_SourceChanged(
                                     Callback<ICoreWebView2SourceChangedEventHandler>(
@@ -588,7 +707,22 @@ void InitWebView2() {
                                         .Get(),
                                     &tok);
 
-                                g_state.webview->Navigate(L"https://www.tiktok.com/");
+                                // Wait for AddScriptToExecuteOnDocumentCreated before initial Navigate.
+                                g_state.webview->AddScriptToExecuteOnDocumentCreated(
+                                    kObserverScript,
+                                    Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
+                                        [](HRESULT script_hr, LPCWSTR) -> HRESULT {
+                                            if (FAILED(script_hr)) {
+                                                AddLog(L"[ERROR] AddScriptToExecuteOnDocumentCreated failed");
+                                            } else {
+                                                AddLog(L"[OK] Observer script registered");
+                                            }
+                                            if (g_state.webview) {
+                                                g_state.webview->Navigate(L"https://www.tiktok.com/");
+                                            }
+                                            return S_OK;
+                                        })
+                                        .Get());
                             }
                             return S_OK;
                         })
@@ -602,11 +736,11 @@ void LayoutControls(HWND hwnd) {
     GetClientRect(hwnd, &rc);
     int w = rc.right - rc.left;
     int h = rc.bottom - rc.top;
-    int left_w = 460;
-    if (w < 800) left_w = w / 2;
+    int left_w = 500;
+    if (w < 860) left_w = w / 2;
 
-    if (g_state.status_hwnd) MoveWindow(g_state.status_hwnd, 10, 85, left_w - 20, 145, TRUE);
-    if (g_state.list_hwnd) MoveWindow(g_state.list_hwnd, 10, 235, left_w - 20, std::max(100, h - 245), TRUE);
+    if (g_state.status_hwnd) MoveWindow(g_state.status_hwnd, 10, 118, left_w - 20, 148, TRUE);
+    if (g_state.list_hwnd) MoveWindow(g_state.list_hwnd, 10, 272, left_w - 20, std::max(100, h - 282), TRUE);
     if (g_state.wv_host_hwnd) MoveWindow(g_state.wv_host_hwnd, left_w, 0, std::max(100, w - left_w), h, TRUE);
     ResizeWebView();
 }
@@ -615,18 +749,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CREATE: {
             auto btn_id = [](int id) { return reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)); };
-            CreateWindowW(L"BUTTON", L"TikTok Login", WS_CHILD | WS_VISIBLE, 10, 10, 105, 30, hwnd, btn_id(IDC_BTN_LOGIN), nullptr, nullptr);
-            CreateWindowW(L"BUTTON", L"Open For You", WS_CHILD | WS_VISIBLE, 120, 10, 105, 30, hwnd, btn_id(IDC_BTN_FORYOU), nullptr, nullptr);
-            CreateWindowW(L"BUTTON", L"Hide/Show WV2", WS_CHILD | WS_VISIBLE, 230, 10, 110, 30, hwnd, btn_id(IDC_BTN_TOGGLE_VIS), nullptr, nullptr);
-            CreateWindowW(L"BUTTON", L"Minimize", WS_CHILD | WS_VISIBLE, 345, 10, 95, 30, hwnd, btn_id(IDC_BTN_MINIMIZE), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"TikTok Login", WS_CHILD | WS_VISIBLE, 10, 10, 105, 28, hwnd, btn_id(IDC_BTN_LOGIN), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Open For You", WS_CHILD | WS_VISIBLE, 120, 10, 105, 28, hwnd, btn_id(IDC_BTN_FORYOU), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Hide/Show WV2", WS_CHILD | WS_VISIBLE, 230, 10, 115, 28, hwnd, btn_id(IDC_BTN_TOGGLE_VIS), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Minimize", WS_CHILD | WS_VISIBLE, 350, 10, 95, 28, hwnd, btn_id(IDC_BTN_MINIMIZE), nullptr, nullptr);
 
-            CreateWindowW(L"BUTTON", L"Reload", WS_CHILD | WS_VISIBLE, 10, 46, 105, 30, hwnd, btn_id(IDC_BTN_RELOAD), nullptr, nullptr);
-            CreateWindowW(L"BUTTON", L"Reset Feed Log", WS_CHILD | WS_VISIBLE, 120, 46, 120, 30, hwnd, btn_id(IDC_BTN_CLEAR), nullptr, nullptr);
-            CreateWindowW(L"BUTTON", L"Diag DOM", WS_CHILD | WS_VISIBLE, 245, 46, 105, 30, hwnd, btn_id(IDC_BTN_DIAG), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Reload", WS_CHILD | WS_VISIBLE, 10, 44, 80, 28, hwnd, btn_id(IDC_BTN_RELOAD), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Reset Queue", WS_CHILD | WS_VISIBLE, 95, 44, 105, 28, hwnd, btn_id(IDC_BTN_CLEAR), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Diag DOM", WS_CHILD | WS_VISIBLE, 205, 44, 95, 28, hwnd, btn_id(IDC_BTN_DIAG), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Pause Media", WS_CHILD | WS_VISIBLE, 305, 44, 110, 28, hwnd, btn_id(IDC_BTN_PAUSE_MEDIA), nullptr, nullptr);
 
-            g_state.status_hwnd = CreateWindowW(L"STATIC", L"Initializing WebView2...", WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 85, 440, 145, hwnd, btn_id(IDC_STATUS_TEXT), nullptr, nullptr);
-            g_state.list_hwnd = CreateWindowW(L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOINTEGRALHEIGHT, 10, 235, 440, 400, hwnd, btn_id(IDC_LOG_LIST), nullptr, nullptr);
-            g_state.wv_host_hwnd = CreateWindowW(L"STATIC", nullptr, WS_CHILD | WS_VISIBLE, 460, 0, 600, 700, hwnd, nullptr, nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"< Prev", WS_CHILD | WS_VISIBLE, 10, 78, 85, 28, hwnd, btn_id(IDC_BTN_PREV), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"Next >", WS_CHILD | WS_VISIBLE, 100, 78, 85, 28, hwnd, btn_id(IDC_BTN_NEXT), nullptr, nullptr);
+            g_state.chk_sync_hwnd = CreateWindowW(L"BUTTON", L"Sync WV2 on Prev/Next", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 195, 78, 190, 28, hwnd, btn_id(IDC_CHK_SYNC), nullptr, nullptr);
+
+            g_state.status_hwnd = CreateWindowW(L"STATIC", L"Initializing WebView2...", WS_CHILD | WS_VISIBLE | SS_LEFT, 10, 118, 480, 148, hwnd, btn_id(IDC_STATUS_TEXT), nullptr, nullptr);
+            g_state.list_hwnd = CreateWindowW(L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOINTEGRALHEIGHT, 10, 272, 480, 400, hwnd, btn_id(IDC_LOG_LIST), nullptr, nullptr);
+            g_state.wv_host_hwnd = CreateWindowW(L"STATIC", nullptr, WS_CHILD | WS_VISIBLE, 500, 0, 600, 700, hwnd, nullptr, nullptr, nullptr);
 
             SetTimer(hwnd, TIMER_METRICS, 1000, nullptr);
             InitWebView2();
@@ -641,17 +780,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_COMMAND:
             switch (LOWORD(wp)) {
                 case IDC_BTN_LOGIN:
-                    if (g_state.webview) g_state.webview->Navigate(L"https://www.tiktok.com/");
+                    if (g_state.webview && FAILED(g_state.webview->Navigate(L"https://www.tiktok.com/"))) {
+                        g_state.nav_errors++;
+                    }
                     AddLog(L"[NAV] https://www.tiktok.com/");
                     break;
                 case IDC_BTN_FORYOU:
-                    if (g_state.webview) g_state.webview->Navigate(L"https://www.tiktok.com/foryou");
+                    if (g_state.webview && FAILED(g_state.webview->Navigate(L"https://www.tiktok.com/foryou"))) {
+                        g_state.nav_errors++;
+                    }
                     AddLog(L"[NAV] https://www.tiktok.com/foryou");
                     break;
                 case IDC_BTN_TOGGLE_VIS:
                     if (g_state.controller) {
                         g_state.wv_visible = !g_state.wv_visible;
-                        g_state.controller->put_IsVisible(g_state.wv_visible ? TRUE : FALSE);
+                        if (FAILED(g_state.controller->put_IsVisible(g_state.wv_visible ? TRUE : FALSE))) {
+                            g_state.wv2_errors++;
+                        }
                         AddLog(g_state.wv_visible ? L"[MODE] WebView2 VISIBLE" : L"[MODE] WebView2 HIDDEN (controller alive)");
                     }
                     break;
@@ -660,19 +805,67 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     AddLog(L"[MODE] Window MINIMIZED");
                     break;
                 case IDC_BTN_RELOAD:
-                    if (g_state.webview) g_state.webview->Reload();
+                    if (g_state.webview && FAILED(g_state.webview->Reload())) {
+                        g_state.nav_errors++;
+                    }
                     AddLog(L"[NAV] Reload");
                     break;
                 case IDC_BTN_CLEAR:
-                    g_state.seen_video_ids.clear();
-                    g_state.ordered_video_ids.clear();
+                    g_state.queue.ResetForAccountSwitch();
                     SendMessageW(g_state.list_hwnd, LB_RESETCONTENT, 0, 0);
-                    AddLog(L"[LOG] Cleared observed IDs");
+                    AddLog(L"[QUEUE] Reset (account switch / clear), gen=" + std::to_wstring(g_state.queue.generation()));
+                    break;
+                case IDC_BTN_PREV:
+                    if (g_state.queue.Previous()) {
+                        const auto* cur = g_state.queue.Current();
+                        AddLog(L"[QUEUE] Prev -> " + (cur ? cur->video_id : L"-"));
+                    } else {
+                        AddLog(L"[QUEUE] At start of queue");
+                    }
+                    if (g_state.sync_wv2_on_nav && g_state.webview) {
+                        g_state.webview->ExecuteScript(L"window.__bgTokStepNav && window.__bgTokStepNav(-1)", nullptr);
+                    }
+                    break;
+                case IDC_BTN_NEXT:
+                    if (g_state.queue.Next()) {
+                        const auto* cur = g_state.queue.Current();
+                        AddLog(L"[QUEUE] Next -> " + (cur ? cur->video_id : L"-"));
+                    } else {
+                        AddLog(L"[QUEUE] End of queue (NEEDS_MORE_ITEMS)");
+                    }
+                    if (g_state.sync_wv2_on_nav && g_state.webview) {
+                        g_state.webview->ExecuteScript(L"window.__bgTokStepNav && window.__bgTokStepNav(1)", nullptr);
+                    }
+                    break;
+                case IDC_CHK_SYNC:
+                    g_state.sync_wv2_on_nav = (SendMessageW(g_state.chk_sync_hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    AddLog(g_state.sync_wv2_on_nav ? L"[SYNC] WV2 step-sync ON" : L"[SYNC] WV2 step-sync OFF");
+                    break;
+                case IDC_BTN_PAUSE_MEDIA:
+                    g_state.media_paused = !g_state.media_paused;
+                    if (g_state.webview) {
+                        g_state.webview->ExecuteScript(
+                            g_state.media_paused
+                                ? L"window.__bgTokSetMediaPaused && window.__bgTokSetMediaPaused(true)"
+                                : L"window.__bgTokSetMediaPaused && window.__bgTokSetMediaPaused(false)",
+                            nullptr);
+                    }
+                    AddLog(g_state.media_paused ? L"[MEDIA] Paused in WebView2" : L"[MEDIA] Resumed in WebView2");
                     break;
                 case IDC_BTN_DIAG:
                     if (g_state.webview) {
                         g_state.webview->ExecuteScript(
-                            L"window.__bgTokDiagDump && window.__bgTokDiagDump()", nullptr);
+                            L"(function(){ return window.__bgTokDiagDump ? window.__bgTokDiagDump() : 'missing'; })()",
+                            Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
+                                [](HRESULT hr, LPCWSTR result_json) -> HRESULT {
+                                    if (FAILED(hr)) {
+                                        AddLog(L"[DIAG-ERR] ExecuteScript hr=" + std::to_wstring(hr));
+                                    } else if (result_json && std::wstring(result_json) != L"\"ok\"") {
+                                        AddLog(L"[DIAG-RES] " + std::wstring(result_json));
+                                    }
+                                    return S_OK;
+                                })
+                                .Get());
                     }
                     break;
             }

@@ -27,5 +27,15 @@ cl.exe /nologo /std:c++20 /EHsc /O2 /W3 `
     /link /SUBSYSTEM:WINDOWS "$LibPath"
 if ($LASTEXITCODE -ne 0) { throw "cl.exe failed with exit code $LASTEXITCODE" }
 
+$TestSrc = Join-Path $Root "feed_queue_tests.cpp"
+$TestExe = Join-Path $BuildDir "feed_queue_tests.exe"
+cl.exe /nologo /std:c++20 /EHsc /O2 /W3 `
+    "$TestSrc" `
+    /Fe:"$TestExe" `
+    /Fo:"$BuildDir\feed_queue_tests.obj"
+if ($LASTEXITCODE -ne 0) { throw "feed_queue_tests compile failed" }
+& "$TestExe"
+if ($LASTEXITCODE -ne 0) { throw "feed_queue_tests failed" }
+
 Write-Host "Built: $OutExe"
 (Get-Item $OutExe) | Select-Object FullName, Length
