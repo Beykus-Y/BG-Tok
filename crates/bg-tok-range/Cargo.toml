@@ -1,0 +1,15 @@
+[package]
+name = "bg-tok-range"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bg-tok = { path = "../bg-tok" }
+futures-util = "0.3"
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+bg-tok-mock = { path = "../bg-tok-mock" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
