@@ -12,7 +12,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::runtime::Handle;
+use tokio::runtime::{Handle, Runtime};
 use tokio_util::sync::CancellationToken;
 
 const OK: c_int = 0;
@@ -36,6 +36,7 @@ pub struct RangeV1 {
 
 struct Bridge {
     runtime: Handle,
+    _runtime_owner: Option<Arc<Runtime>>,
     delivery: MediaDelivery<dyn ContentProvider>,
     id: ContentId,
     source: Mutex<Source>,
@@ -56,6 +57,39 @@ impl RangeSource {
         source: Source,
         length: u64,
     ) -> Result<Self, ProviderError> {
+        Self::new_inner(runtime, None, provider, session, id, source, length)
+    }
+
+    /// Retain the runtime until the last transferred range is released.
+    /// Callbacks and release must run outside that runtime's worker threads.
+    pub fn new_owned_runtime(
+        runtime: Arc<Runtime>,
+        provider: Arc<dyn ContentProvider>,
+        session: CancellationToken,
+        id: ContentId,
+        source: Source,
+        length: u64,
+    ) -> Result<Self, ProviderError> {
+        Self::new_inner(
+            runtime.handle().clone(),
+            Some(runtime),
+            provider,
+            session,
+            id,
+            source,
+            length,
+        )
+    }
+
+    fn new_inner(
+        runtime: Handle,
+        runtime_owner: Option<Arc<Runtime>>,
+        provider: Arc<dyn ContentProvider>,
+        session: CancellationToken,
+        id: ContentId,
+        source: Source,
+        length: u64,
+    ) -> Result<Self, ProviderError> {
         if length == 0
             || length > i64::MAX as u64
             || !provider.capabilities().ranges
@@ -66,6 +100,7 @@ impl RangeSource {
         }
         let context = Box::new(Bridge {
             runtime,
+            _runtime_owner: runtime_owner,
             delivery: MediaDelivery::new(provider, session),
             id,
             source: Mutex::new(source),

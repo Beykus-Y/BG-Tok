@@ -17,7 +17,7 @@ use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
 pub struct Host {
-    runtime: Runtime,
+    runtime: Arc<Runtime>,
     provider: Arc<FileProvider>,
     session: CancellationToken,
     items: Vec<ContentId>,
@@ -41,11 +41,13 @@ pub unsafe extern "C" fn bg_tok_fixture_create(
             )));
         }
         let result = (|| {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .ok()?;
+            let runtime = Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .ok()?,
+            );
             let provider = Arc::new(FileProvider::open(&files, 4).ok()?);
             let session = CancellationToken::new();
             let feed = Feed::with_session(
@@ -88,6 +90,42 @@ pub unsafe extern "C" fn bg_tok_fixture_read_calls(host: *const Host) -> u64 {
     .unwrap_or(0)
 }
 #[no_mangle]
+pub unsafe extern "C" fn bg_tok_fixture_revision(
+    host: *mut Host,
+    index: usize,
+    out: *mut c_char,
+    capacity: usize,
+) -> usize {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(host) = (unsafe { host.as_mut() }) else {
+            return 0;
+        };
+        let Some(id) = host.items.get(index) else {
+            return 0;
+        };
+        let Ok(sources) = host
+            .runtime
+            .block_on(host.provider.sources(id, host.session.clone()))
+        else {
+            return 0;
+        };
+        let Some(revision) = sources.first().and_then(|s| s.revision.as_ref()) else {
+            return 0;
+        };
+        let Some(required) = revision.len().checked_add(1) else {
+            return 0;
+        };
+        if !out.is_null() && capacity >= required {
+            unsafe {
+                std::ptr::copy_nonoverlapping(revision.as_ptr(), out.cast::<u8>(), revision.len());
+                out.add(revision.len()).write(0);
+            }
+        }
+        required
+    }))
+    .unwrap_or(0)
+}
+#[no_mangle]
 pub unsafe extern "C" fn bg_tok_fixture_open(
     host: *mut Host,
     index: usize,
@@ -116,8 +154,8 @@ pub unsafe extern "C" fn bg_tok_fixture_open(
         let Some(length) = source.length else {
             return 4;
         };
-        let Ok(range) = RangeSource::new(
-            host.runtime.handle().clone(),
+        let Ok(range) = RangeSource::new_owned_runtime(
+            host.runtime.clone(),
             host.provider.clone(),
             host.session.clone(),
             id.clone(),
@@ -148,4 +186,42 @@ pub unsafe extern "C" fn bg_tok_fixture_destroy(host: *mut Host) {
             drop(host);
         }
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{ffi::CString, fs, ptr};
+    #[test]
+    fn ranges_keep_runtime_alive_after_host_cancellation() {
+        let path =
+            std::env::temp_dir().join(format!("bg-tok-host-lifetime-{}", std::process::id()));
+        fs::write(&path, b"fixture bytes").unwrap();
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let paths = [name.as_ptr()];
+        unsafe {
+            let host = bg_tok_fixture_create(paths.as_ptr(), paths.len());
+            assert!(!host.is_null());
+            assert_eq!(bg_tok_fixture_count(host), 1);
+            let mut raw = std::mem::MaybeUninit::<RangeV1>::uninit();
+            assert_eq!(bg_tok_fixture_open(host, 0, raw.as_mut_ptr()), 0);
+            let raw = raw.assume_init();
+            bg_tok_fixture_destroy(host);
+            let mut bytes = [0; 4];
+            assert_eq!(
+                (raw.read_at)(
+                    raw.context,
+                    0,
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                    1000,
+                    None,
+                    ptr::null_mut()
+                ),
+                1
+            );
+            (raw.release)(raw.context);
+        }
+        fs::remove_file(path).unwrap();
+    }
 }
