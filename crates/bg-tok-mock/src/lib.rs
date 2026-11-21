@@ -35,14 +35,23 @@ fn metadata(value: &str) -> Metadata {
 
 #[derive(Default)]
 pub struct MockProvider {
+    media: Option<Bytes>,
     closed: AtomicBool,
     calls: AtomicUsize,
     delay_ms: AtomicU64,
+    read_delay_ms: AtomicU64,
     cycle_cursor: AtomicBool,
     next_page_error: Mutex<Option<ProviderError>>,
     events: Mutex<Vec<(ContentId, PlaybackEvent)>>,
 }
 impl MockProvider {
+    pub fn with_media(media: Bytes) -> Self {
+        Self {
+            media: Some(media),
+            ..Self::default()
+        }
+    }
+
     pub fn page_calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
@@ -55,6 +64,12 @@ impl MockProvider {
     }
     pub fn set_page_delay(&self, delay: Duration) {
         self.delay_ms.store(
+            delay.as_millis().min(u64::MAX as u128) as u64,
+            Ordering::SeqCst,
+        );
+    }
+    pub fn set_read_delay(&self, delay: Duration) {
+        self.read_delay_ms.store(
             delay.as_millis().min(u64::MAX as u128) as u64,
             Ordering::SeqCst,
         );
@@ -158,7 +173,14 @@ impl ContentProvider for MockProvider {
         if !["one", "two", "three"].contains(&source.id.as_str()) {
             return Err(ProviderError::NotFound);
         }
-        let data = b"synthetic-media";
+        let delay = Duration::from_millis(self.read_delay_ms.load(Ordering::SeqCst));
+        if !delay.is_zero() {
+            tokio::select! { biased; _ = cancel.cancelled() => return Err(ProviderError::Cancelled), _ = tokio::time::sleep(delay) => {} }
+        }
+        let data = self
+            .media
+            .clone()
+            .unwrap_or_else(|| Bytes::from_static(b"synthetic-media"));
         let (start, end) = match range {
             Some(r) if r.start < data.len() as u64 && r.end.is_none_or(|e| e >= r.start) => (
                 r.start as usize,
@@ -171,7 +193,7 @@ impl ContentProvider for MockProvider {
             None => (0, data.len()),
         };
         Ok(Box::pin(futures_util::stream::once(async move {
-            Ok(Bytes::copy_from_slice(&data[start..end]))
+            Ok(data.slice(start..end))
         })))
     }
     async fn action(
