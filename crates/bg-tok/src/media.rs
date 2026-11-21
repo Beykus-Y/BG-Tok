@@ -33,10 +33,23 @@ impl<P: ContentProvider + ?Sized> MediaDelivery<P> {
     pub async fn open(
         &self,
         id: &ContentId,
-        mut source: Source,
+        source: Source,
         range: Option<ByteRange>,
         cancel: CancellationToken,
     ) -> Result<MediaStream, ProviderError> {
+        self.open_resolved(id, source, range, cancel)
+            .await
+            .map(|(stream, _)| stream)
+    }
+
+    /// Like open, but returns the effective handle so range readers can reuse a refresh.
+    pub async fn open_resolved(
+        &self,
+        id: &ContentId,
+        mut source: Source,
+        range: Option<ByteRange>,
+        cancel: CancellationToken,
+    ) -> Result<(MediaStream, Source), ProviderError> {
         let operation = cancel.child_token();
         let guard = operation.clone().drop_guard();
         let mut refreshed = false;
@@ -75,7 +88,7 @@ impl<P: ContentProvider + ?Sized> MediaDelivery<P> {
                             }
                         },
                     );
-                    return Ok(Box::pin(output));
+                    return Ok((Box::pin(output), source));
                 }
             }
         }
