@@ -54,6 +54,7 @@ pub struct FileProvider {
     slots: Arc<Semaphore>,
     closed: AtomicBool,
     calls: Arc<AtomicUsize>,
+    bytes_per_second: u64,
 }
 impl FileProvider {
     pub fn open<P: AsRef<Path>>(paths: &[P], max_concurrent: usize) -> Result<Self, ProviderError> {
@@ -78,7 +79,13 @@ impl FileProvider {
             slots: Arc::new(Semaphore::new(max_concurrent)),
             closed: AtomicBool::new(false),
             calls: Arc::new(AtomicUsize::new(0)),
+            bytes_per_second: 0,
         })
+    }
+    /// Simulate per-request transfer time in tests; zero disables throttling.
+    pub fn with_rate_limit(mut self, bytes_per_second: u64) -> Self {
+        self.bytes_per_second = bytes_per_second;
+        self
     }
     pub fn read_calls(&self) -> usize {
         self.calls.load(Ordering::Relaxed)
@@ -183,6 +190,10 @@ impl ContentProvider for FileProvider {
             return Err(ProviderError::InvalidResponse);
         }
         let permit = tokio::select! { biased; _ = cancel.cancelled() => return Err(ProviderError::Cancelled), p = self.slots.clone().acquire_owned() => p.map_err(|_| ProviderError::SessionClosed)? };
+        if self.bytes_per_second != 0 {
+            let seconds = (end - range.start + 1) as f64 / self.bytes_per_second as f64;
+            tokio::select! { biased; _ = cancel.cancelled() => return Err(ProviderError::Cancelled), _ = tokio::time::sleep(std::time::Duration::from_secs_f64(seconds)) => {} }
+        }
         let items = self.items.clone();
         let token = cancel.clone();
         let calls = self.calls.clone();

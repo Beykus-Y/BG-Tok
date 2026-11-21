@@ -105,3 +105,72 @@ fn real_mp4_ranges_travel_through_delivery_and_ffi() {
     unsafe { (handle.release)(handle.context) };
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn slow_file_fixture_honors_timeout_and_cross_thread_cancellation() {
+    use std::time::{Duration, Instant};
+    let path = std::env::temp_dir().join(format!("bg-tok-throttle-{}", std::process::id()));
+    fs::write(&path, [7u8; 128]).unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let provider = Arc::new(FileProvider::open(&[&path], 1).unwrap().with_rate_limit(16));
+    let item = bg_tok::provider::ContentId {
+        namespace: "file-fixture".into(),
+        value: "0".into(),
+    };
+    let session = CancellationToken::new();
+    let source = runtime
+        .block_on(provider.sources(&item, CancellationToken::new()))
+        .unwrap()
+        .remove(0);
+    let raw = RangeSource::new(
+        runtime.handle().clone(),
+        provider,
+        session.clone(),
+        item,
+        source,
+        128,
+    )
+    .unwrap()
+    .into_raw();
+    let mut out = [0; 32];
+    let start = Instant::now();
+    assert_eq!(
+        unsafe {
+            (raw.read_at)(
+                raw.context,
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+                30,
+                None,
+                ptr::null_mut(),
+            )
+        },
+        2
+    );
+    assert!(start.elapsed() < Duration::from_secs(1));
+    let cancel = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(30));
+        session.cancel();
+    });
+    assert_eq!(
+        unsafe {
+            (raw.read_at)(
+                raw.context,
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+                1000,
+                None,
+                ptr::null_mut(),
+            )
+        },
+        1
+    );
+    cancel.join().unwrap();
+    unsafe { (raw.release)(raw.context) };
+    fs::remove_file(path).unwrap();
+}

@@ -48,7 +48,11 @@ pub unsafe extern "C" fn bg_tok_fixture_create(
                     .build()
                     .ok()?,
             );
-            let provider = Arc::new(FileProvider::open(&files, 4).ok()?);
+            let rate = std::env::var("BG_TOK_FIXTURE_BYTES_PER_SECOND")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let provider = Arc::new(FileProvider::open(&files, 4).ok()?.with_rate_limit(rate));
             let session = CancellationToken::new();
             let feed = Feed::with_session(
                 provider.clone(),
