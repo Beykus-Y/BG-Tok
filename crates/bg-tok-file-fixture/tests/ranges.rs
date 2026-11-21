@@ -199,3 +199,52 @@ fn slow_file_fixture_honors_timeout_and_cross_thread_cancellation() {
     unsafe { (raw.release)(raw.context) };
     fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn rejects_missing_or_mutated_input() {
+    let path = std::env::temp_dir().join(format!("bg-tok-mutated-{}", std::process::id()));
+    let _ = fs::remove_file(&path);
+    assert!(FileProvider::open(&[&path], 1).is_err());
+    fs::write(&path, [3u8; 128]).unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let provider = Arc::new(FileProvider::open(&[&path], 1).unwrap());
+    let id = bg_tok::provider::ContentId {
+        namespace: "file-fixture".into(),
+        value: "0".into(),
+    };
+    let source = runtime
+        .block_on(provider.sources(&id, CancellationToken::new()))
+        .unwrap()
+        .remove(0);
+    let raw = RangeSource::new(
+        runtime.handle().clone(),
+        provider,
+        CancellationToken::new(),
+        id,
+        source,
+        128,
+    )
+    .unwrap()
+    .into_raw();
+    fs::write(&path, [4u8; 129]).unwrap();
+    let mut buffer = [0; 16];
+    assert_eq!(
+        unsafe {
+            (raw.read_at)(
+                raw.context,
+                0,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                1000,
+                None,
+                ptr::null_mut(),
+            )
+        },
+        3
+    );
+    unsafe { (raw.release)(raw.context) };
+    fs::remove_file(path).unwrap();
+}
